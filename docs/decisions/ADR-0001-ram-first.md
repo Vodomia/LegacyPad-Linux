@@ -6,7 +6,7 @@
 
 ## Context
 
-A PC-less iBEC boot and Alpine RAM root have already worked on this device. Earlier attempts to adapt the Linux NAND volume failed with incompatible or interrupted LwVM headers. Offline diagnostics did not prove the physical 32 GB NAND controller and flash translation layer compatible with the available writer.
+A PC-less iBEC boot and Alpine RAM root have already worked on this device. Earlier attempts to adapt the Linux NAND volume failed on 16 GB-specific LwVM assumptions. The original **apparently mismatched backup header** was later explained by an incorrect 16 GB backup address (LBA 4095); host-side copies at LBA 0 and correct 32 GB LBA 8191 reportedly match. This removes a false corruption warning, **not** the NAND/FTL compatibility gate: offline diagnostics still do not prove the physical 32 GB controller and flash translation layer compatible with the available writer.
 
 Project Cascadia has upstream NAND support, but the maintainer describes the global FTL as capable of affecting iOS's entire flash map on error. Its success on other hardware is not proof of safety for this 32 GB package.
 
