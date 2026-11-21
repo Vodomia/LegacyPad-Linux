@@ -53,7 +53,7 @@ This project builds on the research of [Project Cascadia](https://github.com/rzx
 
 The physical 32 GB NAND/FTL variant has **not** been verified safe for repartitioning or Linux writes. Do not run NAND installation, flash writes, partition changes, or destructive cleanup as a routine development step. Use non-destructive, RAM-root experiments until a separate validated storage decision is approved.
 
-The repository is currently **private**, with potential public release later. Never commit passwords, SSH private keys, Wi-Fi credentials, device identifiers, user-specific local network addresses, firmware blobs, raw NAND dumps, or proprietary videos.
+The repository is currently **public** (checked 2026-11-21). Never commit passwords, SSH private keys, Wi-Fi credentials, device identifiers, user-specific local network addresses, firmware blobs, raw NAND dumps, or proprietary videos. Keep device-specific raw evidence off-repository and publish only sanitized excerpts.
 
 ## Status
 
