@@ -8,9 +8,14 @@ All milestones require physical-device evidence and a reviewable PR before they 
 - [x] Capture current Alpine/RAM/GPU/audio/package baseline.
 - [x] Document architecture, risks, upstream provenance and agent rules.
 - [ ] Choose an original-code license compatible with any incorporated GPL-2.0 upstream components.
-- [ ] Agree on the final public repository name (`LegacyPad-Linux` proposed).
+- [x] Rename the working repository to `LegacyPad-Linux` and keep it private during experimentation; public branding can be revisited before release.
 
-## P1 — Prove media playback **(next)**
+## P1 — Reproducible RAM boot image + media playback **(next)**
+
+- [ ] Audit the custom initramfs and PC-less packaging pipeline; preserve a known-good boot image and hashes.
+- [ ] Host-only proof: bake one small, non-secret utility/default into a new RAM image and enforce iBEC size and RAM limits.
+- [ ] Review rollback and obtain separate authorization before any on-iPad boot-image update.
+- [ ] Confirm the utility survives **two cold boots**, one without Wi-Fi. This proves image repeatability, **not user-data persistence**.
 
 - [ ] Refresh Alpine package index over Wi-Fi; record DNS, mirror and package availability.
 - [ ] Inspect actual DRM devices, EGL stack and sound card.
@@ -20,11 +25,11 @@ All milestones require physical-device evidence and a reviewable PR before they 
 - [ ] Record frame drops, audio sync, input responsiveness and battery cost.
 - [ ] Decide: `mpv`/Wayland, a simpler direct-render option, or an audio-first product.
 
-**Gate:** reproducible playback test with measured acceptable results and a recovery plan.
+**Gates:** (A) verified repeatable RAM image with a known-good boot recovery path; (B) reproducible playback test with acceptable hardware measurements.
 
 ## P2 — Solve offline persistence
 
-- [ ] Independently characterize the physical 32 GB NAND/FTL before considering writes.
+- [ ] Independently characterize the physical 32 GB NAND/FTL, including the 32 MiB LwVM chunks and previously divergent headers, **before considering writes**.
 - [ ] Compare *safe* durable-storage options, including limitations of iOS Data encryption and unverified USB host mode.
 - [ ] Pick one mechanism only after physical tests and explicit risk approval.
 - [ ] Demonstrate content + progress surviving two cold boots, with Wi-Fi disabled.
