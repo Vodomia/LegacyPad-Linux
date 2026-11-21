@@ -86,7 +86,7 @@ Dropbear rejected incoming sessions with “`/root must be owned by user or root
 
 ## Why this path was chosen for the 32 GB unit
 
-The original NAND install reported inconsistent dual LwVM header copies; a separate source path expected **16 billion** media bytes and rejected the observed **32 billion**. Gemini's dynamic-media-source changes and offline tests were **not** a hardware-proven fix. Rather than initiate further FTL/partition writes, the project switched to a RAM Linux root with a durable **boot payload on iOS System**. See [the 32 GB NAND investigation](../research/2026-11-21-p105-32gb-nand.md).
+The original NAND install reported inconsistent dual LwVM header copies because its **16 GB** code read the supposed backup at LBA 4095. A subsequent **local snapshot audit** found matching primary and backup headers at LBA 0 and the correct **32 GB** backup LBA 8191; the older error was likely a false alarm. Other code still expected **16 billion** media bytes and rejected the observed **32 billion**. Gemini's dynamic-media changes and offline tests were **not** a hardware-proven NAND-writer fix. Rather than initiate further FTL/partition writes, the project switched to a RAM Linux root with a durable **boot payload on iOS System**. See [the 32 GB NAND investigation](../research/2026-11-21-p105-32gb-nand.md).
 
 **Correction for future reports:** saying this process “never writes NAND” is inaccurate. Uploading the six iOS System files **writes NAND via iOS**. The narrower and verified claim is that the resulting Linux root runs in RAM and its bootargs/driver setup do not intentionally write a Linux NAND volume.
 
