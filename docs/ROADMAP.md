@@ -8,7 +8,7 @@ All milestones require physical-device evidence and a reviewable PR before they 
 - [x] Capture current Alpine/RAM/GPU/audio/package baseline.
 - [x] Document architecture, risks, upstream provenance and agent rules.
 - [ ] Choose an original-code license compatible with any incorporated GPL-2.0 upstream components.
-- [x] Rename the working repository to `LegacyPad-Linux` and keep it private during experimentation; public branding can be revisited before release.
+- [x] Rename the working repository to `LegacyPad-Linux`; it was made public on 2026-11-21 to give the local engineer access. Audit all future commits for secrets and sensitive device artifacts.
 
 ## P1 — Reproducible RAM boot image + media playback **(next)**
 
