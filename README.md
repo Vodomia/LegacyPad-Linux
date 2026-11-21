@@ -35,7 +35,11 @@ The present device runs Linux without any cable after triggering the boot from i
 - [Verified baseline](docs/HARDWARE_BASELINE.md): observations vs. upstream claims.
 - [Architecture](docs/ARCHITECTURE.md): boot, media, UI, synchronization and storage gates.
 - [Roadmap](docs/ROADMAP.md): measurable milestones.
-- [Research](docs/research/2026-11-21-feasibility.md): links and open questions.
+- [Research](docs/research/2026-11-21-feasibility.md): feasibility sources and open questions.
+- [Actual 32 GB device bring-up](docs/bringup/2026-11-21-32gb-pcless-ram-linux.md): the PC-less RAM Linux installation, incidents and observed outcome.
+- [32 GB NAND investigation](docs/research/2026-11-21-p105-32gb-nand.md): independent dynamic LwVM evidence, the unresolved FTL gate, and prior-art search.
+- [Reboot persistence research](docs/research/2026-11-21-persistence.md): reproducible system images vs. durable media/settings.
+- [Gemini engineering handoff](docs/handoffs/GEMINI-PERSISTENCE-32GB-AUDIT.md): bounded, host-first research instructions.
 - [Safety decision](docs/decisions/ADR-0001-ram-first.md): why NAND writing is blocked for this device.
 - [Agent rules](AGENTS.md): requirements for AI-assisted contributions.
 
@@ -49,7 +53,7 @@ This project builds on the research of [Project Cascadia](https://github.com/rzx
 
 The physical 32 GB NAND/FTL variant has **not** been verified safe for repartitioning or Linux writes. Do not run NAND installation, flash writes, partition changes, or destructive cleanup as a routine development step. Use non-destructive, RAM-root experiments until a separate validated storage decision is approved.
 
-This is a public repository. Never commit passwords, SSH private keys, Wi-Fi credentials, device identifiers, user-specific local network addresses, or proprietary videos.
+The repository is currently **private**, with potential public release later. Never commit passwords, SSH private keys, Wi-Fi credentials, device identifiers, user-specific local network addresses, firmware blobs, raw NAND dumps, or proprietary videos.
 
 ## Status
 
