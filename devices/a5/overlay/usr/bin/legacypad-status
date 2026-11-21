@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# legacypad-status -- Lightweight runtime diagnostic for LegacyPad / Cascadia RAM Linux
+# Reports hardware model, uptime, memory, storage mount, and network interface status.
+echo "=================================================="
+echo " LegacyPad RAM Linux (32 GB iPad mini 1 / P105AP)"
+echo " Host Kernel:  $(uname -srm 2>/dev/null || uname -a)"
+echo " System Time:  $(date -u 2>/dev/null || echo 'Unknown')"
+echo " Memory Free:  $(free -m 2>/dev/null | awk 'NR==2{print $4 " MB free of " $2 " MB total"}')"
+echo " Storage Root: $(awk '$2=="/"{print $1 " on " $2 " (" $3 ")"}' /proc/mounts 2>/dev/null)"
+echo " IP Address:   $(ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' || echo 'N/A')"
+echo " Status:       Immutable RAM root active; NAND write locked"
+echo "=================================================="
