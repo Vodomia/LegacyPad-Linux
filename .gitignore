@@ -1,0 +1,42 @@
+# Device-derived or proprietary material
+*.ipsw
+*.shsh
+*.shsh2
+*.deb
+*.ipa
+*.img3
+*.bin
+*.dtb
+*.zImage
+*.key
+*.pem
+*.p12
+
+# Credentials and private configurations
+.env
+.env.*
+!.env.example
+**/secrets/
+**/credentials/
+**/private/
+
+# Generated builds, firmware, and logs
+build/
+dist/
+cache/
+.cache/
+*.log
+*.tmp
+*.bak
+*.new
+__pycache__/
+.pytest_cache/
+.DS_Store
+
+# Large media/test footage is not stored in public Git
+*.mp4
+*.mkv
+*.mov
+*.m4a
+*.mp3
+*.wav
