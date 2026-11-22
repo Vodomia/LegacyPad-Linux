@@ -9,15 +9,15 @@
 
 ## 1. Executive Summary
 
-During an extended RAM Linux run with an iPad mini 1 connected to a host computer via a Lightning USB cable, the iPad battery completely drained to 0% and shut down into hardware Under-Voltage Lockout (UVLO). The device currently displays only the red low-battery screen and cannot boot into iOS or Linux.
+During an extended RAM Linux run with the owner's iPad mini 1 connected to a host computer via a Lightning cable, the battery drained and the device shut down at the low-battery screen. **The device subsequently recovered, booted into iOS and charged past 50%.** The earlier wording that it is still stuck at the red battery screen is obsolete.
 
-A comprehensive host-only audit of the Cascadia charging driver (`apple-pmu-charger.c`), device tree (`p105ap.dts`), kernel configuration (`p105ap.config`), and hardware documentation revealed:
+A host-only review of Cascadia's charging driver (`apple-pmu-charger.c`), device tree (`p105ap.dts`), kernel configuration (`p105ap.config`), and upstream [charging issue #23](https://github.com/rzxvx/Project-Cascadia/issues/23) suggests a plausible cause; **the owner's PMU register and net battery current were not captured at the moment of failure**. In particular:
 1. **The 100 mA Sag Latch Trap:** The upstream `apple-pmu-charger.c` driver contained an architectural latching flaw: when input voltage (VBUS) sags—which occurs reliably when ramping beyond 500 mA on standard PC USB 2.0 ports—the Dialog D1946 PMU hardware automatically drops register `0x3d` (`PMU_ILIM`) to `0x02` (100 mA). The driver latched this backoff ceiling permanently until physical cable disconnection ("until unplugged").
-2. **Severe Power Deficit:** The iPad mini 1 in Linux draws ~385 mA to 510 mA (display backlight, LCD scanout, dual-core A5 SoC, RAM). Clamped to 100 mA input, the battery experienced a continuous net drain of −285 mA to −410 mA, leading to inevitable battery depletion over several hours while plugged in.
+2. **Potential Power Deficit:** The separate unit measured in upstream issue #23 discharged at roughly −385 mA when the PMU input limit stayed near 100 mA. Those are **upstream physical measurements, not measurements on the owner's iPad**; a similar limit on the owner's source could explain the observed drain.
 3. **Misleading Telemetry:** The sysfs `input_current_limit` property erroneously returned either requested target or cached `last_written` rather than querying actual hardware register `0x3d`, hiding autonomous PMU hardware clamps from user space.
 4. **Endless Sag Oscillations on Weak Ports:** A naive timer retry would create endless 60-second ramp-sag cycles on weak 500 mA ports, creating repetitive voltage dips and kernel log spam.
-5. **Autonomous UVLO State:** Battery depletion leaves the TI bq27540 gauge in low-voltage disconnect and the PMU in hardware pre-charge mode (~100–300 mA trickle). A standard 500 mA PC port cannot revive it because the red low-battery display screen alone draws ~350 mA, canceling out the pre-charge current.
-6. **Completely Reversible:** PMU registers are volatile I2C SRAM. Zero hardware registers or NAND state were corrupted. A genuine Apple 10W/12W wall adapter connected directly to AC mains safely restores the charge.
+5. **Low-battery Recovery:** The owner observed that the iPad initially remained on the low-battery screen overnight, then eventually booted and charged under iOS. The exact failure to accept charge initially, cell voltage, and input current were not measured.
+6. **Observed Recovery, Not Proof of Zero Damage:** The successful return to iOS and subsequent charging is reassuring, but no physical inspection or full NAND integrity test was performed. Do not claim the hardware or NAND was conclusively unaffected.
 
 We have designed, implemented, and verified a robust, host-tested driver remediation featuring:
 - **Direct Register 0x3d Readback:** Sysfs queries PMU register `0x3d` over regmap directly.
@@ -31,7 +31,7 @@ We have designed, implemented, and verified a robust, host-tested driver remedia
 ## 2. Technical Root-Cause Analysis
 
 ### 2.1 The iPad mini 1 Active Power Budget in Linux
-Physical hardware measurements on the iPad mini 1 under Cascadia Linux establish the following active current draw:
+The following **rough component estimates are hypotheses** for system power budgeting. They were not measured individually on the owner's device:
 - **Display Subsystem:** WLED backlight driver (LP8559) + 1024x768 LVDS scanout: ~250–320 mA.
 - **Base SoC & System Memory:** Dual-core S5L8942 A5 SoC, LPDDR2 RAM, PMGR clock trees: ~135–190 mA.
 - **Total System Current Draw ($I_{sys}$):** ~385 mA (idle) to 510 mA (active CPU/GPU load).
@@ -81,7 +81,7 @@ When plugged into a host PC USB 2.0 port (rated for 500 mA):
 | **Recovery Method** | Standard power button or cable insertion | Genuine Apple 10W/12W wall charger connected directly to AC mains for 45–60 minutes |
 
 ### Physical Recovery Findings
-1. **No Hardware Damage:** Lithium-ion cells in iPad mini 1 are protected by internal PCM (Protection Circuit Module) and the bq27540 gas gauge. Hardware UVLO prevents destructive cell reversal.
+1. **Hardware health remains unverified:** The battery recovered in iOS, but a deep discharge is not evidence of zero degradation. Avoid unattended tests until power measurements are available.
 2. **Why PC USB Cannot Revive It:** The iPad mini 1 screen and backlight turn on automatically when connected to power to display the low-battery graphic. The display subsystem consumes ~350 mA. If the source only provides 500 mA (or drops to 100 mA), net current into the battery during the pre-charge phase is $\le 0\text{ mA}$.
 3. **Mandatory Wall Charger Recovery:** A genuine Apple 10W/12W iPad brick or 20W USB-C PD brick with Lightning adapter negotiates up to 2.1–2.4 A. The PMU pre-charge circuit receives its full current budget regardless of display backlight state, safely bringing the cell above the 3.6 V operating threshold within 20–30 minutes.
 
