@@ -12,7 +12,7 @@ Upstream [Cascadia issue #23](https://github.com/rzxvx/Project-Cascadia/issues/2
 
 ## Implemented read-only guard
 
-`devices/a5/overlay/usr/bin/legacypad-charge-gate` is a BusyBox-compatible script which only **reads** `/sys/class/power_supply/` and the charger module's `armed` flag. It does not touch PMU registers, install packages, flash storage, or power off the device.
+`devices/a5/overlay/usr/bin/legacypad-charge-gate` is a BusyBox-compatible script which only **reads** `/sys/class/power_supply/` and the charger module's `armed` flag. It does not touch PMU registers, install packages, flash storage, or power off the device. Call it as `sh /usr/bin/legacypad-charge-gate` until executable file mode is verified in the rebuilt image.
 
 - `--once` takes a snapshot; **a single passing reading is not charging acceptance**.
 - `--gate` checks seven consecutive readings over six minutes, enough to span several configured 60-second retry windows. On **any** failure it stops with a nonzero exit status.
@@ -27,8 +27,8 @@ Host-side test: `sh devices/a5/tests/test-charge-gate.sh` — 10/10 controlled s
 1. In **iOS**, charge to at least 70% with a dependable 10 W/12 W or better iPad-compatible wall supply, and make sure iOS still starts normally. Keep the approved known-good bundle/hashes and recovery instructions on the host.
 2. Before upgrading boot files, use the existing `p105-pcless.sh check-ios` and **verify the intended candidate bundle and rollback target**. Only change the iOS System boot files with the user's explicit approval; never touch the NAND partition table or FTL directly.
 3. Rebuild and verify the candidate image so it actually includes `legacypad-charge-gate`. Use the existing `p105-pcless.sh` **update/rollback** mechanism, then start Linux from iOS. All binary checks, sizes and actual on-device launch remain **NOT TESTED** for the new guard.
-4. Immediately on the Linux console, with the power supply still connected, run `legacypad-charge-gate --once`. If it fails, **stop testing and return to iOS**. A quick pass permits only the next step, not an extended workload.
-5. With the operator watching, run `legacypad-charge-gate --gate`. Stop on missing telemetry, current at or below +100 mA, PMU limit at or below 100 mA, overheating, cable disconnect, or any abnormal behavior. Report capacity and current over time without private device identifiers.
+4. Immediately on the Linux console, with the power supply still connected, run `sh /usr/bin/legacypad-charge-gate --once`. If it fails, **stop testing and return to iOS**. A quick pass permits only the next step, not an extended workload.
+5. With the operator watching, run `sh /usr/bin/legacypad-charge-gate --gate`. Stop on missing telemetry, current below +100 mA, PMU limit at or below 100 mA, overheating, cable disconnect, or any abnormal behavior. Report capacity and current over time without private device identifiers.
 6. Only after a sustained pass, consider an additional short, attended audio load and repeat the guard. No unattended or overnight Linux use until repeated physical evidence supports it.
 
 **Rollback:** Return to iOS (as already demonstrated), and use the existing previous-image rollback route if candidate charging fails. Do not delete the known-good files to save space. A reboot, clean iOS boot and resumed iOS charging are part of acceptance, not optional extras.
