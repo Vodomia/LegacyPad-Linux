@@ -12,7 +12,7 @@ Upstream [Cascadia issue #23](https://github.com/rzxvx/Project-Cascadia/issues/2
 
 ## Implemented read-only guard
 
-`devices/a5/overlay/usr/bin/legacypad-charge-gate` is a BusyBox-compatible script which only **reads** `/sys/class/power_supply/` and the charger module's `armed` flag. It does not touch PMU registers, install packages, flash storage, or power off the device. Call it as `sh /usr/bin/legacypad-charge-gate` until executable file mode is verified in the rebuilt image.
+`devices/a5/overlay/usr/bin/legacypad-charge-gate` is a BusyBox-compatible script which only **reads** `/sys/class/power_supply/` and the charger module's `armed` flag. Reading the input limit through sysfs invokes the kernel driver's PMU-register **read**, but this script never writes PMU registers, installs packages, flashes storage, or powers off the device. Call it as `sh /usr/bin/legacypad-charge-gate` until executable file mode is verified in the rebuilt image.
 
 - `--once` takes a snapshot; **a single passing reading is not charging acceptance**.
 - `--gate` checks seven consecutive readings over six minutes, enough to span several configured 60-second retry windows. On **any** failure it stops with a nonzero exit status.
