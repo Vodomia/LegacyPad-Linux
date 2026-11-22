@@ -1,6 +1,6 @@
 # Roadmap and acceptance gates
 
-All milestones require physical-device evidence and a reviewable PR before they are marked complete.
+All milestones require physical-device evidence and a reviewable PR before they are marked complete. This document records the owner's **2026-11-22 priority decision**: Linux completion first, YouTube last and optional. Do not start another low-resolution playback proof of concept.
 
 ## P0 — Establish project baseline
 
@@ -8,51 +8,51 @@ All milestones require physical-device evidence and a reviewable PR before they 
 - [x] Capture current Alpine/RAM/GPU/audio/package baseline.
 - [x] Document architecture, risks, upstream provenance and agent rules.
 - [ ] Choose an original-code license compatible with any incorporated GPL-2.0 upstream components.
-- [x] Rename the working repository to `LegacyPad-Linux`; it was made public on 2026-11-21 to give the local engineer access. Audit all future commits for secrets and sensitive device artifacts.
+- [x] Rename the working repository to `LegacyPad-Linux`; it was made public on 2026-11-21 to give the local engineer access. Audit future commits for secrets and sensitive artifacts.
 
-## P1 — Reproducible RAM boot image + media playback **(next)**
+## P1 — Reliable PC-less Linux and charging **(current priority)**
 
-- [ ] Audit the custom initramfs and PC-less packaging pipeline; preserve a known-good boot image and hashes.
-- [ ] Host-only proof: bake one small, non-secret utility/default into a new RAM image and enforce iBEC size and RAM limits.
-- [ ] Review rollback and obtain separate authorization before any on-iPad boot-image update.
-- [ ] Confirm the utility survives **two cold boots**, one without Wi-Fi. This proves image repeatability, **not user-data persistence**.
+- [ ] Preserve and independently verify the exact known-good image, current iOS boot artifacts, hashes, and recovery path before updating anything.
+- [ ] Finish an independently reproducible, full candidate build with the charging patch and read-only `legacypad-charge-gate` included. Host tests and GitHub CI are prerequisites, **not physical acceptance**.
+- [ ] Under separate owner authorization, update only the existing PC-less iOS System boot artifacts, keeping the previous image and rollback available. Never alter the 32 GB partition table or FTL in this phase.
+- [ ] With suitable wall power and the device charged in iOS, verify actual **positive net battery current**, temperature and input-current behavior under Linux. Run the documented attended six-minute charging gate; then verify sustained charging under an ordinary system workload.
+- [ ] Demonstrate two cold boot cycles, including one without Wi-Fi; verify clean return to iOS, charging under iOS and rollback on a failed candidate.
 
-- [ ] Refresh Alpine package index over Wi-Fi; record DNS, mirror and package availability.
-- [ ] Inspect actual DRM devices, EGL stack and sound card.
-- [ ] Estimate RAM/disk dependency footprint *before* attempting `mpv` installation.
-- [ ] Play short audio-only sample with speakers; measure memory and CPU.
-- [ ] Play 240p/360p low-complexity H.264 + AAC test clips, first via a temporary network stream, then from RAM if space permits.
-- [ ] Record frame drops, audio sync, input responsiveness and battery cost.
-- [ ] Decide: `mpv`/Wayland, a simpler direct-render option, or an audio-first product.
+**Gate:** demonstrated, repeatable, recoverable Linux boot and measured stable charging on **this physical iPad**. Do not claim completion from simulations.
 
-**Gates:** (A) verified repeatable RAM image with a known-good boot recovery path; (B) reproducible playback test with acceptable hardware measurements.
+## P2 — Durable offline Linux installation and settings
 
-## P2 — Solve offline persistence
+- [ ] Independently characterize the owner's physical 32 GB PPN/FTL and LwVM mapping (32 MiB chunks, header at LBA 0 and proposed backup LBA 8191), including firmware and block/CAU topology, by **read-only** methods.
+- [ ] Audit all capacity assumptions, iOS filesystem resize operations, Linux driver mapping, repair paths and restoration requirements before even considering a NAND write.
+- [ ] Compare viable persistent root/data strategies against the requirement that the iPad works **without a home computer or network**. NFS alone does not satisfy this.
+- [ ] Choose a storage method only after hardware-specific evidence, independent review, a verified recovery route and separate explicit owner risk approval. If those gates cannot be satisfied, keep the NAND write route blocked and document the honest limitation.
+- [ ] Prove that installed software, device settings and a small test file survive two cold boots offline.
 
-- [ ] Independently characterize the physical 32 GB NAND/FTL, including the 32 MiB LwVM chunks and previously divergent headers, **before considering writes**.
-- [ ] Compare *safe* durable-storage options, including limitations of iOS Data encryption and unverified USB host mode.
-- [ ] Pick one mechanism only after physical tests and explicit risk approval.
-- [ ] Demonstrate content + progress surviving two cold boots, with Wi-Fi disabled.
+**Gate:** safe independent operation, actual persistence and documented rollback. The existing RAM-root boot does **not** meet this milestone.
 
-**Gate:** no accidental iOS loss, persistent content, documented rollback.
+## P3 — Usable standalone tablet fundamentals
 
-## P3 — Touch-first interface
+- [ ] Confirm the core screen, touch, orientation, physical keys, Wi-Fi, basic audio, battery status and charging through repeatable hardware tests.
+- [ ] Select the lightest viable user interaction stack from measurements; avoid desktop/UI work until P1 and P2 gates are resolved.
+- [ ] Provide a practical settings and maintenance workflow without SSH or a laptop for normal use.
+- [ ] Validate sleep/wake or document its limitations, power consumption, controlled shutdown and recovery.
 
-- [ ] Choose UI stack from the P1 measurements.
-- [ ] Library, pause/seek, playback speed, subtitles, battery and network controls.
-- [ ] Touch use without SSH or a laptop.
+**Gate:** usable day-to-day Linux without attached computer, clear limitations and no unobserved battery drain.
 
-## P4 — Content preparation and synchronization
+## P4 — Reproducibility, documentation and handoff
 
-- [ ] Host content importer/transcoder for authorized educational media.
-- [ ] Checksums, resume-safe transfers, course metadata, subtitles.
-- [ ] Offline sync/restore tests; minimal human setup.
+- [ ] Build from a clean clone on a second Linux computer with exact upstream/source provenance.
+- [ ] Expand CI for release manifests, packaging, safety checks and non-hardware tests.
+- [ ] Complete upstream licensing, security and sensitive-artifact review.
+- [ ] Publish English installation, recovery, rollback and maintenance documentation.
+- [ ] Release only after P1–P3 acceptance on physical hardware.
 
-## P5 — Handoff quality
+## P5 — Optional media and YouTube **(last, not release-blocking)**
 
-- [ ] Reproducible clean-room build on a second Linux computer.
-- [ ] CI for manifest, packaging and non-hardware unit tests.
-- [ ] Explicit security/licensing audit and maintainer guide.
-- [ ] Release with known-good rollback, installation guide and limitations.
+This is **not a current development task**. Owner requirement: **at least 720p source-video playback**. No 240p/360p product target, no low-resolution fallback presented as success. The screen itself is 1024×768; a 1280×720 source may be scaled for display, but acceptable 720p decoding, audio sync, temperature and battery impact must be physically measured.
 
-**Priority:** no new GUI framework, agent swarm or NAND flashing until P1 evidence exists. The original owner can delegate later using the stable evidence and acceptance criteria above.
+- [ ] Only after P0–P4, determine whether ≥720p lectures are viable on this exact hardware.
+- [ ] If reliable 720p playback cannot be demonstrated, **drop YouTube/video support instead of forcing a lower-resolution solution**.
+- [ ] If viable and separately approved, consider lawful media fetching, offline course content, subtitles and resume functionality.
+
+**Priority lock:** charging → reliable boot → offline persistence → tablet fundamentals → handoff → optional ≥720p media. Do not start media work or NAND writing to bypass an earlier gate.
