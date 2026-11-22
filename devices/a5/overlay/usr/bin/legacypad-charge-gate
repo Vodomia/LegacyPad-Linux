@@ -1,0 +1,80 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Read-only charging acceptance gate for the experimental P105 RAM boot.
+# A positive current is the battery gauge's *net* charge, not PMU input power.
+set -eu
+
+BAT=/sys/class/power_supply/battery
+PMU=/sys/class/power_supply/apple-pmu-usb
+ARMED=/sys/module/apple_pmu_charger/parameters/armed
+
+read_number() {
+    [ -r "$1" ] || return 1
+    IFS= read -r value < "$1" || [ -n "${value:-}" ] || return 1
+    case "$value" in
+        -*) digits=${value#-} ;;
+        *) digits=$value ;;
+    esac
+    case "$digits" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$value"
+}
+
+sample() {
+    # Missing/unreadable telemetry is a failed gate, never a healthy reading.
+    capacity=$(read_number "$BAT/capacity") || { echo 'FAIL: battery capacity unavailable' >&2; return 2; }
+    current=$(read_number "$BAT/current_now") || { echo 'FAIL: battery current unavailable' >&2; return 2; }
+    temp=$(read_number "$BAT/temp") || { echo 'FAIL: battery temperature unavailable' >&2; return 2; }
+    present=$(read_number "$BAT/present") || { echo 'FAIL: battery presence unavailable' >&2; return 2; }
+    online=$(read_number "$PMU/online") || { echo 'FAIL: PMU cable status unavailable' >&2; return 2; }
+    limit=$(read_number "$PMU/input_current_limit") || { echo 'FAIL: PMU input limit unavailable' >&2; return 2; }
+    [ -r "$ARMED" ] || { echo 'FAIL: charger armed state unavailable' >&2; return 2; }
+    IFS= read -r enabled < "$ARMED" || [ -n "${enabled:-}" ] || return 2
+
+    printf 'capacity=%s%% net_current=%s_uA temp=%s_dC vbus=%s input_limit=%s_uA armed=%s\n' \
+        "$capacity" "$current" "$temp" "$online" "$limit" "$enabled"
+
+    [ "$present" -eq 1 ] && [ "$capacity" -ge 50 ] && [ "$capacity" -le 100 ] || {
+        echo 'FAIL: battery missing, below 50%, or invalid capacity' >&2; return 1;
+    }
+    [ "$temp" -ge 0 ] && [ "$temp" -lt 400 ] || {
+        echo 'FAIL: temperature is unavailable or too high for this experimental gate' >&2; return 1;
+    }
+    [ "$online" -eq 1 ] || { echo 'FAIL: external power not detected' >&2; return 1; }
+    case "$enabled" in
+        1|Y|y|yes|true) ;;
+        *) echo 'FAIL: charging driver is not armed' >&2; return 1 ;;
+    esac
+    [ "$limit" -gt 100000 ] || {
+        echo 'FAIL: PMU input current limit at or below 100 mA' >&2; return 1;
+    }
+    [ "$current" -ge 100000 ] || {
+        echo 'FAIL: net battery charging below +100 mA' >&2; return 1;
+    }
+}
+
+case "${1:---once}" in
+    --once)
+        echo 'Read-only charging snapshot (NOT a sustained acceptance test).'
+        sample
+        ;;
+    --gate)
+        # 7 samples cover six minutes, including three 60-second sag retries.
+        n=1
+        while [ "$n" -le 7 ]; do
+            printf 'Charging sample %s/7: ' "$n"
+            if ! sample; then
+                echo 'STOP: Charging not proven. Return to iOS; do not begin playback tests.' >&2
+                exit 1
+            fi
+            if [ "$n" -lt 7 ]; then sleep 60; fi
+            n=$((n + 1))
+        done
+        echo 'PASS: Six-minute monitored charging gate. Continue observing battery under load.'
+        ;;
+    *)
+        echo 'Usage: legacypad-charge-gate --once | --gate' >&2
+        exit 2
+        ;;
+esac
