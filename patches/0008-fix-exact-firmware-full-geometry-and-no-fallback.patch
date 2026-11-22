@@ -1,0 +1,729 @@
+From 74468d4ac29f5e9128a823f91851cded4459d2ad Mon Sep 17 00:00:00 2001
+From: Antigravity Assistant <antigravity@google.com>
+Date: Sun, 22 Nov 2026 17:47:01 +0300
+Subject: [PATCH] fix(a5): require exact NAND firmware, full geometry, and zero
+ builder fallback
+
+- Require exact NAND firmware identity and full physical geometry matching in nand_diagnose.py
+- Reject all missing or mismatched blocks, page counts, row-address bits and CE information
+- Add regression tests in test_lwvm_dynamic.py reproducing all three false-positive readiness cases
+- Remove diagnostic builder candidate fallback in make-diag-kernelcache.sh; require synchronized zImage, vmlinux, and kernel-config from the same build
+- Reconcile diagnostic image hashes and test telemetry in documentation
+---
+ devices/a5/tools/make-diag-kernelcache.sh     |  70 ++++--
+ devices/a5/tools/nand-volume/nand_diagnose.py | 219 +++++++++++++-----
+ .../a5/tools/nand-volume/test_lwvm_dynamic.py | 215 ++++++++++++++++-
+ .../2026-11-22-32gb-nand-readiness.md         |  13 +-
+ 4 files changed, 436 insertions(+), 81 deletions(-)
+
+diff --git a/devices/a5/tools/make-diag-kernelcache.sh b/devices/a5/tools/make-diag-kernelcache.sh
+index c8200ab..02200b4 100755
+--- a/devices/a5/tools/make-diag-kernelcache.sh
++++ b/devices/a5/tools/make-diag-kernelcache.sh
+@@ -48,33 +48,61 @@ if b'apple_ftl.auto_mount=0' not in dtb:
+ print('   DTB validation OK (magic=0xd00dfeed, totalsize=', size, 'bytes, hold_probe=1 verified)')
+ "
+ 
+-echo "==> 2. Hardened DTB replacement / concatenation onto diagnostic zImage..."
++echo "==> 2. Verifying diagnostic kernel build artifacts (same build, zero candidate fallback)..."
+ python3 -c "
+ import struct, sys, os
+ 
+ raw_z_path = '$CASCADIA_ROOT/devices/a5/build/out/zImage'
+-cand_z_path = '$OUTPUT_DIR/candidate-zImage-dtb'
++vmlinux_path = '$CASCADIA_ROOT/devices/a5/build/linux/vmlinux'
++config_path = '$CASCADIA_ROOT/devices/a5/build/out/kernel-config'
+ dtb = open('$TMP_DIR/p105ap-nand-ro.dtb', 'rb').read()
+ 
+-if os.path.isfile(raw_z_path) and os.path.getsize(raw_z_path) > 10000000:
+-    print('   Using compiled diagnostic raw zImage from:', raw_z_path)
+-    raw_zimage = open(raw_z_path, 'rb').read()
+-    # Check if raw_zimage accidentally already has an FDT appended
+-    off = raw_zimage.rfind(bytes.fromhex('d00dfeed'))
+-    if off > 0 and off + struct.unpack_from('>I', raw_zimage, off + 4)[0] == len(raw_zimage):
+-        raw_zimage = raw_zimage[:off]
+-elif os.path.isfile(cand_z_path):
+-    print('   Extracting raw zImage from template:', cand_z_path)
+-    cand_z = open(cand_z_path, 'rb').read()
+-    off = cand_z.rfind(bytes.fromhex('d00dfeed'))
+-    if off <= 0:
+-        sys.exit('Corrupted input zImage-dtb: FDT magic 0xd00dfeed not found')
+-    fdt_size = struct.unpack_from('>I', cand_z, off + 4)[0]
+-    if off + fdt_size != len(cand_z):
+-        sys.exit(f'Corrupted input image size: off={off} + fdt_size={fdt_size} != total={len(cand_z)}')
+-    raw_zimage = cand_z[:off]
+-else:
+-    sys.exit('No suitable zImage found to attach DTB to!')
++# 1. Existence and size verification (STRICT: ZERO fallback to candidate kernels)
++if not os.path.isfile(raw_z_path) or os.path.getsize(raw_z_path) < 10000000:
++    sys.exit(f'FATAL: Diagnostic zImage missing or truncated: {raw_z_path}')
++if not os.path.isfile(vmlinux_path) or os.path.getsize(vmlinux_path) < 20000000:
++    sys.exit(f'FATAL: Diagnostic vmlinux missing or truncated: {vmlinux_path}')
++if not os.path.isfile(config_path) or os.path.getsize(config_path) < 50000:
++    sys.exit(f'FATAL: Diagnostic kernel-config missing or truncated: {config_path}')
++
++# 2. Build synchronization check (must be from the same build)
++z_mtime = os.path.getmtime(raw_z_path)
++v_mtime = os.path.getmtime(vmlinux_path)
++c_mtime = os.path.getmtime(config_path)
++if abs(z_mtime - v_mtime) > 300 or abs(v_mtime - c_mtime) > 300:
++    sys.exit(f'FATAL: Build artifact desynchronization! mtimes: zImage={z_mtime}, vmlinux={v_mtime}, config={c_mtime}')
++
++# 3. Kernel configuration verification
++cfg = open(config_path, 'r', errors='ignore').read()
++if 'CONFIG_APPLE_PPN=y' not in cfg:
++    sys.exit('FATAL: CONFIG_APPLE_PPN=y missing from diagnostic kernel config!')
++if 'CONFIG_APPLE_SFTL=y' in cfg:
++    sys.exit('FATAL: CONFIG_APPLE_SFTL=y found in diagnostic kernel config! Swiss FTL must be disabled.')
++if 'CONFIG_APPLE_SFTL_WRITE=y' in cfg:
++    sys.exit('FATAL: CONFIG_APPLE_SFTL_WRITE=y found in diagnostic kernel config! Program/erase must be disabled.')
++if 'CONFIG_CHARGER_APPLE_PMU=y' not in cfg:
++    sys.exit('FATAL: CONFIG_CHARGER_APPLE_PMU=y missing from diagnostic kernel config!')
++
++# 4. vmlinux binary symbol verification
++vml = open(vmlinux_path, 'rb').read()
++if b'apple_ppn_probe' not in vml:
++    sys.exit('FATAL: apple_ppn_probe symbol missing from diagnostic vmlinux!')
++if b'apple_ppn_geometry' not in vml:
++    sys.exit('FATAL: apple_ppn_geometry symbol missing from diagnostic vmlinux!')
++if b'apple_ftl' in vml:
++    sys.exit('FATAL: Swiss FTL symbols (apple_ftl) detected in diagnostic vmlinux! Must be completely excluded.')
++if b'tx_page' in vml:
++    sys.exit('FATAL: Flash write function tx_page detected in diagnostic vmlinux! Must be excluded by SFTL_NO_WRITE.')
++
++print('   Diagnostic kernel artifacts verified (zImage, vmlinux, kernel-config synchronized from same build)')
++
++# 5. Concatenate DTB onto verified diagnostic raw zImage
++raw_zimage = open(raw_z_path, 'rb').read()
++
++# Strip any accidental trailing DTB from raw_zimage if present
++off = raw_zimage.rfind(bytes.fromhex('d00dfeed'))
++if off > 0 and off + struct.unpack_from('>I', raw_zimage, off + 4)[0] == len(raw_zimage):
++    raw_zimage = raw_zimage[:off]
+ 
+ combined = raw_zimage + dtb
+ off_new = combined.rfind(bytes.fromhex('d00dfeed'))
+diff --git a/devices/a5/tools/nand-volume/nand_diagnose.py b/devices/a5/tools/nand-volume/nand_diagnose.py
+index def0ecb..76647a5 100755
+--- a/devices/a5/tools/nand-volume/nand_diagnose.py
++++ b/devices/a5/tools/nand-volume/nand_diagnose.py
+@@ -48,24 +48,28 @@ DRIVER_EXPECTATIONS = {
+ KNOWN_PROFILES = {
+     '040472P_HYNIX_B_': {
+         'name': 'Reference 16 GB (Hynix B)',
++        'firmware': '040472P_HYNIX_B_',
+         'blocks': 1064,
+         'mlc_pages': 256,
+         'slc_pages': 128,
+         'page_bits': 8,
+         'block_bits': 11,
+         'cau_bits': 4,
++        'ce_bitmap': '0101',
+         'num_sb': 1055,
+         'reported_lbas': 3906250,
+         'writable': True,
+     },
+     '030800P': {
+         'name': 'Alternative 16 GB (PR #52)',
++        'firmware': '030800P',
+         'blocks': 2088,
+         'mlc_pages': 128,
+         'slc_pages': 64,
+         'page_bits': 7,
+         'block_bits': 12,
+         'cau_bits': 1,
++        'ce_bitmap': '0101',
+         'num_sb': 2079,
+         'reported_lbas': 3906250,
+         'writable': True,
+@@ -406,25 +410,21 @@ def audit_hardware_compatibility(hw_info):
+         })
+         driver_ready = False
+ 
+-    # 4. PPN Controller Firmware & Package Profile
++    # 4. PPN Controller Firmware & Package Profile (Requires EXACT match)
+     fw = hw_info.get('ppn_firmware')
+-    blocks = hw_info.get('blocks_per_cau')
+     if fw:
+-        for prof_key, prof in KNOWN_PROFILES.items():
+-            if prof_key in fw:
+-                matched_profile = prof
+-                break
+-        if matched_profile:
++        if fw in KNOWN_PROFILES:
++            matched_profile = KNOWN_PROFILES[fw]
+             findings.append({
+                 'component': 'PPN Firmware & Profile',
+                 'status': 'SUPPORTED',
+-                'details': f'Firmware "{fw}" matches tested {matched_profile["name"]} profile.'
++                'details': f'Firmware "{fw}" exactly matches verified {matched_profile["name"]} profile.'
+             })
+         else:
+             findings.append({
+                 'component': 'PPN Firmware & Profile',
+                 'status': 'READ_ONLY_PROBE_ALLOWED',
+-                'details': f'Firmware "{fw}" is an untested geometry. Upstream PR #52 permits safe read-only probe, but program/erase and FTL mounting are strictly blocked.'
++                'details': f'Firmware "{fw}" is not a verified package. Read-only probe permitted; writes and FTL mounting are strictly blocked.'
+             })
+             driver_ready = False
+     else:
+@@ -435,41 +435,167 @@ def audit_hardware_compatibility(hw_info):
+         })
+         driver_ready = False
+ 
+-    # 5. NAND Physical Blocks per CAU
+-    if blocks:
+-        if matched_profile and blocks == matched_profile['blocks']:
++    # 5. Full Physical Geometry Matching (All parameters required and strictly verified)
++    blocks = hw_info.get('blocks_per_cau')
++    mlc_pages = hw_info.get('mlc_pages')
++    slc_pages = hw_info.get('slc_pages')
++    page_bits = hw_info.get('page_bits')
++    block_bits = hw_info.get('block_bits')
++    cau_bits = hw_info.get('cau_bits')
++    ce = hw_info.get('ce_bitmap')
++
++    if matched_profile is not None:
++        # Check blocks_per_cau
++        if blocks is None:
++            findings.append({
++                'component': 'NAND Blocks/CAU',
++                'status': 'UNVERIFIED',
++                'details': 'Physical block count unverified. SFTL superblock allocation cannot be proven.'
++            })
++            driver_ready = False
++        elif blocks == matched_profile['blocks']:
+             findings.append({
+                 'component': 'NAND Blocks/CAU',
+                 'status': 'SUPPORTED',
+                 'details': f'Blocks per CAU ({blocks}) matches {matched_profile["name"]} profile ({matched_profile["blocks"]}).'
+             })
+-        elif blocks == 1064 or blocks == 2088:
++        else:
+             findings.append({
+                 'component': 'NAND Blocks/CAU',
++                'status': 'BLOCKED',
++                'details': f'Blocks per CAU mismatch: got {blocks}, expected {matched_profile["blocks"]} for {matched_profile["name"]}.'
++            })
++            driver_ready = False
++
++        # Check page counts (MLC & SLC)
++        if mlc_pages is None or slc_pages is None:
++            findings.append({
++                'component': 'NAND Page Counts',
++                'status': 'UNVERIFIED',
++                'details': 'MLC/SLC page counts unverified in hardware telemetry.'
++            })
++            driver_ready = False
++        elif mlc_pages == matched_profile['mlc_pages'] and slc_pages == matched_profile['slc_pages']:
++            findings.append({
++                'component': 'NAND Page Counts',
+                 'status': 'SUPPORTED',
+-                'details': f'Blocks per CAU ({blocks}) matches a known 16 GB profile.'
++                'details': f'Page counts (MLC {mlc_pages}, SLC {slc_pages}) match {matched_profile["name"]} profile.'
+             })
+-        elif blocks == 2128:
++        else:
+             findings.append({
+-                'component': 'NAND Blocks/CAU',
+-                'status': 'READ_ONLY_PROBE_ALLOWED',
+-                'details': f'Blocks per CAU is 2128 (dense 32 GB package). Read-only probe allowed; writes blocked pending physical FTL dump.'
++                'component': 'NAND Page Counts',
++                'status': 'BLOCKED',
++                'details': f'Page count mismatch: got MLC={mlc_pages}/SLC={slc_pages}, expected {matched_profile["mlc_pages"]}/{matched_profile["slc_pages"]} for {matched_profile["name"]}.'
+             })
+             driver_ready = False
++
++        # Check row address bits (page, block, cau)
++        if page_bits is None or block_bits is None or cau_bits is None:
++            findings.append({
++                'component': 'Row Address Bit Widths',
++                'status': 'UNVERIFIED',
++                'details': 'Row address bit widths (page/block/cau) unverified in hardware telemetry.'
++            })
++            driver_ready = False
++        elif (page_bits == matched_profile['page_bits'] and
++              block_bits == matched_profile['block_bits'] and
++              cau_bits == matched_profile['cau_bits']):
++            findings.append({
++                'component': 'Row Address Bit Widths',
++                'status': 'SUPPORTED',
++                'details': f'Row address bit widths (page={page_bits}, block={block_bits}, cau={cau_bits}) match {matched_profile["name"]} profile.'
++            })
+         else:
+             findings.append({
+-                'component': 'NAND Blocks/CAU',
+-                'status': 'READ_ONLY_PROBE_ALLOWED',
+-                'details': f'Blocks per CAU ({blocks}) is an untested physical configuration. Read-only probe allowed; writes blocked.'
++                'component': 'Row Address Bit Widths',
++                'status': 'BLOCKED',
++                'details': f'Row bit width mismatch: got page={page_bits}/block={block_bits}/cau={cau_bits}, expected {matched_profile["page_bits"]}/{matched_profile["block_bits"]}/{matched_profile["cau_bits"]} for {matched_profile["name"]}.'
++            })
++            driver_ready = False
++
++        # Check Chip Enable Bitmap
++        if ce is None:
++            findings.append({
++                'component': 'DeviceTree CE Bitmap',
++                'status': 'UNVERIFIED',
++                'details': 'CE bitmap unverified on hardware.'
++            })
++            driver_ready = False
++        elif ce == matched_profile.get('ce_bitmap', '0101'):
++            findings.append({
++                'component': 'DeviceTree CE Bitmap',
++                'status': 'SUPPORTED',
++                'details': f'Discovered CE bitmap: 0x{ce}. Dual-bus CE0 active on both channels.'
++            })
++        else:
++            findings.append({
++                'component': 'DeviceTree CE Bitmap',
++                'status': 'BLOCKED',
++                'details': f'Unsupported or mismatched CE bitmap: 0x{ce}. Expected dual-bus 0x{matched_profile.get("ce_bitmap", "0101")}.'
+             })
+             driver_ready = False
++
+     else:
+-        findings.append({
+-            'component': 'NAND Blocks/CAU',
+-            'status': 'UNVERIFIED',
+-            'details': 'Physical block count unverified. SFTL superblock allocation cannot be proven.'
+-        })
++        # Profile is NOT matched (untested firmware or missing firmware)
++        # Any physical geometry reported is strictly READ_ONLY_PROBE_ALLOWED or UNVERIFIED
+         driver_ready = False
++        if blocks:
++            findings.append({
++                'component': 'NAND Blocks/CAU',
++                'status': 'READ_ONLY_PROBE_ALLOWED',
++                'details': f'Blocks per CAU ({blocks}) is an unverified physical configuration. Read-only probe allowed; writes blocked.'
++            })
++        else:
++            findings.append({
++                'component': 'NAND Blocks/CAU',
++                'status': 'UNVERIFIED',
++                'details': 'Physical block count unverified. SFTL superblock allocation cannot be proven.'
++            })
++
++        if mlc_pages is not None or slc_pages is not None:
++            findings.append({
++                'component': 'NAND Page Counts',
++                'status': 'READ_ONLY_PROBE_ALLOWED',
++                'details': f'Page counts (MLC={mlc_pages}, SLC={slc_pages}) unverified against tested profiles.'
++            })
++        else:
++            findings.append({
++                'component': 'NAND Page Counts',
++                'status': 'UNVERIFIED',
++                'details': 'MLC/SLC page counts unverified in hardware telemetry.'
++            })
++
++        if page_bits is not None or block_bits is not None or cau_bits is not None:
++            findings.append({
++                'component': 'Row Address Bit Widths',
++                'status': 'READ_ONLY_PROBE_ALLOWED',
++                'details': f'Row address bits (page={page_bits}, block={block_bits}, cau={cau_bits}) unverified against tested profiles.'
++            })
++        else:
++            findings.append({
++                'component': 'Row Address Bit Widths',
++                'status': 'UNVERIFIED',
++                'details': 'Row address bit widths unverified in hardware telemetry.'
++            })
++
++        if ce == '0101':
++            findings.append({
++                'component': 'DeviceTree CE Bitmap',
++                'status': 'SUPPORTED',
++                'details': f'Discovered CE bitmap: 0x{ce}. Dual-bus CE0 active on both channels.'
++            })
++        elif ce:
++            findings.append({
++                'component': 'DeviceTree CE Bitmap',
++                'status': 'BLOCKED',
++                'details': f'Unsupported or mismatched CE bitmap: 0x{ce}. Expected dual-bus 0x0101.'
++            })
++        else:
++            findings.append({
++                'component': 'DeviceTree CE Bitmap',
++                'status': 'UNVERIFIED',
++                'details': 'CE bitmap unverified on hardware.'
++            })
+ 
+     # 6. Physical vs Logical Capacity & Geometry Cross-Validation
+     if lw.get('valid'):
+@@ -507,29 +633,6 @@ def audit_hardware_compatibility(hw_info):
+                 })
+                 driver_ready = False
+ 
+-    # 7. Chip Enable Bitmap
+-    ce = hw_info.get('ce_bitmap')
+-    if ce == '0101':
+-        findings.append({
+-            'component': 'DeviceTree CE Bitmap',
+-            'status': 'SUPPORTED',
+-            'details': f'Discovered CE bitmap: 0x{ce}. Dual-bus CE0 active on both channels.'
+-        })
+-    elif ce:
+-        findings.append({
+-            'component': 'DeviceTree CE Bitmap',
+-            'status': 'BLOCKED',
+-            'details': f'Unsupported or mismatched CE bitmap: 0x{ce}. Expected dual-bus 0x0101.'
+-        })
+-        driver_ready = False
+-    else:
+-        findings.append({
+-            'component': 'DeviceTree CE Bitmap',
+-            'status': 'UNVERIFIED',
+-            'details': 'CE bitmap unverified on hardware.'
+-        })
+-        driver_ready = False
+-
+     hw_info['audit'] = {
+         'overall_driver_ready': driver_ready,
+         'findings': findings
+@@ -576,14 +679,26 @@ def diagnose_live_ios():
+     diag['kernel_nand_logs'] = ppn_lines
+     
+     for line in ppn_lines:
+-        if '040472P_HYNIX_B_' in line:
+-            diag['ppn_firmware'] = '040472P_HYNIX_B_'
+-        m = re.search(r'firmware[:\s]+([0-9A-Za-z_]+)', line, re.IGNORECASE)
++        m = re.search(r'package firmware\s+([0-9A-Za-z_]+)', line)
+         if m:
+             diag['ppn_firmware'] = m.group(1)
++        else:
++            m_fw = re.search(r'firmware[:\s]+([0-9A-Za-z_]+)', line, re.IGNORECASE)
++            if m_fw:
++                diag['ppn_firmware'] = m_fw.group(1)
+         m_blk = re.search(r'blocks[:\s]+(\d+)', line, re.IGNORECASE)
+         if m_blk:
+             diag['blocks_per_cau'] = int(m_blk.group(1))
++        m_geo = re.search(r'package geometry\s+(\d+)\s+blocks\s*x\s*(\d+)\s+pages\s*\(SLC\s*(\d+)\)', line)
++        if m_geo:
++            diag['blocks_per_cau'] = int(m_geo.group(1))
++            diag['mlc_pages'] = int(m_geo.group(2))
++            diag['slc_pages'] = int(m_geo.group(3))
++        m_bits = re.search(r'row bits page\s+(\d+)\s+block\s+(\d+)\s+cau\s+(\d+)', line)
++        if m_bits:
++            diag['page_bits'] = int(m_bits.group(1))
++            diag['block_bits'] = int(m_bits.group(2))
++            diag['cau_bits'] = int(m_bits.group(3))
+ 
+     # 3. IORegistry query for DeviceTree CE bitmap (read-only)
+     ioreg_ce = run_ios_cmd('ioreg -p IODeviceTree -k ce-bitmap -l 2>/dev/null') or ''
+diff --git a/devices/a5/tools/nand-volume/test_lwvm_dynamic.py b/devices/a5/tools/nand-volume/test_lwvm_dynamic.py
+index 20b1cb8..9f07de1 100644
+--- a/devices/a5/tools/nand-volume/test_lwvm_dynamic.py
++++ b/devices/a5/tools/nand-volume/test_lwvm_dynamic.py
+@@ -481,7 +481,7 @@ class LwvmDynamicTest(unittest.TestCase):
+         hdr_16 = generate_synthetic_16gb()
+         res_16 = nand_diagnose.parse_lwvm_header(hdr_16)
+ 
+-        # 1. Reference 16 GB profile (040472P_HYNIX_B_, 1064 blocks) with valid 16 GB dual-headers
++        # 1. Reference 16 GB profile (040472P_HYNIX_B_, 1064 blocks) with valid 16 GB dual-headers & full geometry
+         diag_ref = {
+             'mode': 'offline_headers',
+             'lwvm': res_16,
+@@ -489,6 +489,11 @@ class LwvmDynamicTest(unittest.TestCase):
+             'backup_matches_primary': True,
+             'ppn_firmware': '040472P_HYNIX_B_',
+             'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
+             'ce_bitmap': '0101',
+         }
+         nand_diagnose.audit_hardware_compatibility(diag_ref)
+@@ -496,7 +501,7 @@ class LwvmDynamicTest(unittest.TestCase):
+         self.assertTrue(any(f['status'] == 'SUPPORTED' and 'Reference 16 GB' in f['details']
+                             for f in diag_ref['audit']['findings']))
+ 
+-        # 2. PR #52 alternative 16 GB profile (030800P, 2088 blocks) with valid 16 GB dual-headers
++        # 2. PR #52 alternative 16 GB profile (030800P, 2088 blocks) with valid 16 GB dual-headers & full geometry
+         diag_pr52 = {
+             'mode': 'offline_headers',
+             'lwvm': res_16,
+@@ -504,6 +509,11 @@ class LwvmDynamicTest(unittest.TestCase):
+             'backup_matches_primary': True,
+             'ppn_firmware': '030800P',
+             'blocks_per_cau': 2088,
++            'mlc_pages': 128,
++            'slc_pages': 64,
++            'page_bits': 7,
++            'block_bits': 12,
++            'cau_bits': 1,
+             'ce_bitmap': '0101',
+         }
+         nand_diagnose.audit_hardware_compatibility(diag_pr52)
+@@ -520,13 +530,18 @@ class LwvmDynamicTest(unittest.TestCase):
+             'backup_matches_primary': True,
+             'ppn_firmware': '32G_UNKNOWN_TOSHIBA',
+             'blocks_per_cau': 2128,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 8,
++            'block_bits': 12,
++            'cau_bits': 2,
+             'ce_bitmap': '0101',
+         }
+         nand_diagnose.audit_hardware_compatibility(diag_32gb)
+         # MUST fail closed for driver readiness
+         self.assertFalse(diag_32gb['audit']['overall_driver_ready'],
+                          "Untested 32 GB package MUST NOT be marked ready for writes")
+-        self.assertTrue(any(f['status'] == 'READ_ONLY_PROBE_ALLOWED' and 'untested geometry' in f['details']
++        self.assertTrue(any(f['status'] == 'READ_ONLY_PROBE_ALLOWED' and ('unverified' in f['details'].lower() or 'not a verified package' in f['details'])
+                             for f in diag_32gb['audit']['findings']))
+ 
+     def test_review_fix_1_unbound_local_error_missing_firmware(self):
+@@ -637,6 +652,200 @@ class LwvmDynamicTest(unittest.TestCase):
+         self.assertTrue(any(f['component'] == 'Dual-Header Consistency' and f['status'] == 'BLOCKED'
+                             for f in diag_no_backup['audit']['findings']))
+ 
++    def test_false_positive_case_1_inexact_firmware_and_unknown_blocks(self):
++        """False-Positive Case 1: Inexact firmware strings or unknown firmware with known block counts.
++        Historical bug: 'if prof_key in fw:' allowed substring matching ('040472P_HYNIX_B_EXTRA'),
++        and 'elif blocks == 1064:' declared readiness for unknown firmware strings.
++        Validation must require exact firmware identity and fail closed.
++        """
++        import nand_diagnose
++        hdr_16 = generate_synthetic_16gb()
++        res_16 = nand_diagnose.parse_lwvm_header(hdr_16)
++
++        # 1a. Substring firmware match (040472P_HYNIX_B_EXTRA)
++        diag_substring = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_EXTRA',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
++            'ce_bitmap': '0101',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_substring)
++        self.assertFalse(diag_substring['audit']['overall_driver_ready'],
++                         "Substring firmware match MUST NOT be marked ready for writes")
++        self.assertTrue(any(f['component'] == 'PPN Firmware & Profile' and f['status'] == 'READ_ONLY_PROBE_ALLOWED'
++                            for f in diag_substring['audit']['findings']))
++
++        # 1b. Unknown firmware with 1064 blocks (historical fallback flaw)
++        diag_unknown_fw = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': 'UNKNOWN_VENDOR_NAND',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
++            'ce_bitmap': '0101',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_unknown_fw)
++        self.assertFalse(diag_unknown_fw['audit']['overall_driver_ready'],
++                         "Unknown firmware with 1064 blocks MUST NOT declare driver readiness")
++        self.assertTrue(any(f['component'] == 'PPN Firmware & Profile' and f['status'] == 'READ_ONLY_PROBE_ALLOWED'
++                            for f in diag_unknown_fw['audit']['findings']))
++
++    def test_false_positive_case_2_missing_or_mismatched_page_counts(self):
++        """False-Positive Case 2: Known firmware with missing or mismatched MLC/SLC page counts.
++        Historical bug: Only firmware and blocks_per_cau were audited; page counts were ignored.
++        Validation must require exact MLC and SLC page counts and fail closed on any omission or mismatch.
++        """
++        import nand_diagnose
++        hdr_16 = generate_synthetic_16gb()
++        res_16 = nand_diagnose.parse_lwvm_header(hdr_16)
++
++        # 2a. Missing page counts (None)
++        diag_missing_pages = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_',
++            'blocks_per_cau': 1064,
++            'mlc_pages': None,
++            'slc_pages': None,
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
++            'ce_bitmap': '0101',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_missing_pages)
++        self.assertFalse(diag_missing_pages['audit']['overall_driver_ready'],
++                         "Missing page counts MUST NOT declare driver readiness")
++        self.assertTrue(any(f['component'] == 'NAND Page Counts' and f['status'] == 'UNVERIFIED'
++                            for f in diag_missing_pages['audit']['findings']))
++
++        # 2b. Mismatched page counts (128 MLC / 64 SLC on Hynix B profile)
++        diag_mismatched_pages = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 128,  # Mismatch: profile expects 256
++            'slc_pages': 64,   # Mismatch: profile expects 128
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
++            'ce_bitmap': '0101',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_mismatched_pages)
++        self.assertFalse(diag_mismatched_pages['audit']['overall_driver_ready'],
++                         "Mismatched page counts MUST NOT declare driver readiness")
++        self.assertTrue(any(f['component'] == 'NAND Page Counts' and f['status'] == 'BLOCKED'
++                            for f in diag_mismatched_pages['audit']['findings']))
++
++    def test_false_positive_case_3_missing_or_mismatched_row_bits_and_ce(self):
++        """False-Positive Case 3: Known firmware with missing/mismatched row-address bits or CE bitmap.
++        Historical bug: Row-address bits and CE bitmap were ignored, risking corruption in SFTL translation.
++        Validation must verify page_bits, block_bits, cau_bits, and ce_bitmap against verified profile.
++        """
++        import nand_diagnose
++        hdr_16 = generate_synthetic_16gb()
++        res_16 = nand_diagnose.parse_lwvm_header(hdr_16)
++
++        # 3a. Missing row-address bits
++        diag_missing_bits = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': None,
++            'block_bits': None,
++            'cau_bits': None,
++            'ce_bitmap': '0101',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_missing_bits)
++        self.assertFalse(diag_missing_bits['audit']['overall_driver_ready'],
++                         "Missing row-address bits MUST NOT declare driver readiness")
++        self.assertTrue(any(f['component'] == 'Row Address Bit Widths' and f['status'] == 'UNVERIFIED'
++                            for f in diag_missing_bits['audit']['findings']))
++
++        # 3b. Mismatched row-address bits (page 7, block 12, cau 1 on Hynix B profile)
++        diag_mismatched_bits = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 7,   # Mismatch: profile expects 8
++            'block_bits': 12, # Mismatch: profile expects 11
++            'cau_bits': 1,    # Mismatch: profile expects 4
++            'ce_bitmap': '0101',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_mismatched_bits)
++        self.assertFalse(diag_mismatched_bits['audit']['overall_driver_ready'],
++                         "Mismatched row-address bits MUST NOT declare driver readiness")
++        self.assertTrue(any(f['component'] == 'Row Address Bit Widths' and f['status'] == 'BLOCKED'
++                            for f in diag_mismatched_bits['audit']['findings']))
++
++        # 3c. Missing CE bitmap
++        diag_missing_ce = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
++            'ce_bitmap': None,
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_missing_ce)
++        self.assertFalse(diag_missing_ce['audit']['overall_driver_ready'])
++        self.assertTrue(any(f['component'] == 'DeviceTree CE Bitmap' and f['status'] == 'UNVERIFIED'
++                            for f in diag_missing_ce['audit']['findings']))
++
++        # 3d. Mismatched CE bitmap (0103 instead of 0101)
++        diag_mismatched_ce = {
++            'mode': 'offline_headers',
++            'lwvm': res_16,
++            'backup_header': res_16,
++            'backup_matches_primary': True,
++            'ppn_firmware': '040472P_HYNIX_B_',
++            'blocks_per_cau': 1064,
++            'mlc_pages': 256,
++            'slc_pages': 128,
++            'page_bits': 8,
++            'block_bits': 11,
++            'cau_bits': 4,
++            'ce_bitmap': '0103',
++        }
++        nand_diagnose.audit_hardware_compatibility(diag_mismatched_ce)
++        self.assertFalse(diag_mismatched_ce['audit']['overall_driver_ready'])
++        self.assertTrue(any(f['component'] == 'DeviceTree CE Bitmap' and f['status'] == 'BLOCKED'
++                            for f in diag_mismatched_ce['audit']['findings']))
++
+     def test_review_fix_4_dmesg_parser_safety_and_ambiguity(self):
+         """Review Item 4: parse_dmesg_ppn_diag must not default read_only=True and must not equate profile selection to mount."""
+         import nand_diagnose
+diff --git a/docs/research/2026-11-22-32gb-nand-readiness.md b/docs/research/2026-11-22-32gb-nand-readiness.md
+index f10b6a7..1bd78d6 100644
+--- a/docs/research/2026-11-22-32gb-nand-readiness.md
++++ b/docs/research/2026-11-22-32gb-nand-readiness.md
+@@ -19,7 +19,7 @@ The current PC-less Alpine Linux system boots reliably in RAM (`root=/dev/ram0`)
+ This engineering report:
+ 1. Conducts an independent review of upstream Project Cascadia PR #52, analyzing its per-package geometry profile approach against our 32 GB changes.
+ 2. Audits every remaining hardcoded 16 GB assumption across `nand-volume.sh`, `lwvm.py`, PPN, VFL, SFTL, header backup locations, and tools, while preserving our verified 32 GB LwVM dynamic capacity scaling.
+-3. Prepares an **isolated, host-only read-only PPN diagnostic kernel candidate** (`pcless-ppn-diag`, SHA-256: `c9fd3b87...`) using the working PC-less bootchain and proven PMU charging driver.
++3. Prepares an **isolated, host-only read-only PPN diagnostic kernel candidate** (`pcless-ppn-diag`, SHA-256: `aca998f2...`) using the working PC-less bootchain and proven PMU charging driver.
+ 4. Enforces read-only behavior by construction: RAM rootfs (`root=/dev/ram0`), armed PMU charging (`apple_pmu_charger.armed=1`), disabled FTL auto-mount (`apple_ftl.auto_mount=0`), zero write flags, and fail-closed logging for unknown geometries.
+ 5. Implements automated host-side regression tests verifying geometry profile detection, fail-closed read-only behavior on untested packages, and bootargs safety constraints.
+ 6. Maintains the known-good baseline (`5ab87f2c...`) and candidate (`78dd1025...`) byte-for-byte unchanged.
+@@ -137,9 +137,9 @@ To safely discover the physical properties of our 32 GB NAND without risking har
+ | Artifact | Path | Size (Bytes) | SHA-256 Checksum |
+ | :--- | :--- | :--- | :--- |
+ | **Diagnostic Kernelcache** | `build/p105/pcless-ppn-diag/kernelcache` | 33,586,460 | `aca998f26a78b1300751d9abe96e975d15937fc5136310899985667c0680e80f` |
+-| **Diagnostic Bundle** | `output/ppn-diag-staging-bundle.bin` | 29,850,112 | `6ba19f4a081da26b489c629fb4dd966d5257dfd248b64e52565dd5451a44e5bc` |
+-| **Diagnostic zImage-DTB** | `output/ppn-diag-zImage-dtb` | 28,605,635 | `58bb9bb0fa848d1b191df5871f30a91176bc5e47854e75471c080064d1f2b4ff` |
+-| **Diagnostic DTB** | `output/p105ap-nand-ro.dtb` | 10,947 | `e439d528b939f60cb0a08e1e75ff89063febe7e96a4a6e0f3ddf817ea8bb56d4` |
++| **Diagnostic Bundle** | `output/ppn-diag-staging-bundle.bin` | 29,850,112 | `41debdea5fb7e96dd466383c5af3c84aa0061e2c72bf2fed867add18bddffab2` |
++| **Diagnostic zImage-DTB** | `output/ppn-diag-zImage-dtb` | 28,605,635 | `e1b61d89d1393fa4fe0f0028ed9107a681369d8ff9b9b9ae53677cb1ce2995c5` |
++| **Diagnostic DTB** | `output/p105ap-nand-ro.dtb` | 10,947 | `3cd90ade8aaeb43e1a2fbc6cded863fc63664696b87e032b4ba538edd8dc5798` |
+ | **iBEC Upgrade Loader** | `build/p105/pcless-ppn-diag/iBEC.upgrade` | 282,624 | `ede34b70bf7f8a7f819f1e6a96c94f4f0ecc2c060af4dfe61ffe7a363f7865ef` |
+ | **DeviceTree** | `build/p105/pcless-ppn-diag/devicetree` | 79,328 | `9abf1a5f73a824bf2652909ec24584ecaff09c725bbea80bfa20b833ccf6b6dd` |
+ | **Ramdisk** | `build/p105/pcless-ppn-diag/ramdisk` | 4,188 | `22459577003a9dbd6e92c132371e321098044e711b507709ad09b09176008dd8` |
+@@ -218,7 +218,7 @@ OUT=$CASCADIA_ROOT/devices/a5/build/p105/pcless-ppn-diag bash devices/a5/tools/p
+ All verification suites were executed against the updated codebase:
+ 
+ ```
+-[1] test_lwvm_dynamic.py (21/21 PASSED in 0.038s):
++[1] test_lwvm_dynamic.py (24/24 PASSED in 0.045s):
+     - test_16gb_geometry_regression                         [PASS]
+     - test_16gb_synthetic_header_create_remove              [PASS]
+     - test_32gb_header_properties                          [PASS]
+@@ -228,6 +228,9 @@ All verification suites were executed against the updated codebase:
+     - test_fail_closed_on_invalid_and_corrupt_crc           [PASS]
+     - test_fail_closed_on_missing_dependency               [PASS]
+     - test_fail_closed_on_validator_exception              [PASS]
++    - test_false_positive_case_1_inexact_firmware_and_unknown_blocks [PASS]
++    - test_false_positive_case_2_missing_or_mismatched_page_counts   [PASS]
++    - test_false_positive_case_3_missing_or_mismatched_row_bits_and_ce [PASS]
+     - test_interrupted_write_and_recovery_simulation       [PASS]
+     - test_mocked_success_validator_cannot_bypass_corrupt_crc [PASS]
+     - test_nand_diagnose_header_validation_and_audit        [PASS]
+-- 
+2.43.0
+
