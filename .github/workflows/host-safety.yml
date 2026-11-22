@@ -1,0 +1,39 @@
+name: Host-only safety tests
+
+'on':
+  pull_request:
+    paths:
+      - 'devices/a5/**'
+      - '.github/workflows/host-safety.yml'
+  push:
+    branches:
+      - 'feat/custom-ram-status-utility'
+    paths:
+      - 'devices/a5/**'
+      - '.github/workflows/host-safety.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  safe-host-tests:
+    name: Simulated hardware and rollback tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check shell syntax
+        run: |
+          sh -n devices/a5/overlay/usr/bin/legacypad-charge-gate
+          sh -n devices/a5/tests/test-charge-gate.sh
+          sh -n devices/a5/tests/test-power-diagnostics.sh
+          bash -n devices/a5/tests/test-pcless-rollback.sh
+          bash -n devices/a5/tools/p105-pcless.sh
+      - name: Run isolated host-only tests
+        run: |
+          sh devices/a5/tests/test-charge-gate.sh
+          sh devices/a5/tests/test-power-diagnostics.sh
+          python3 devices/a5/tests/test-pmu-charger-faults.py
+          python3 devices/a5/tools/nand-volume/test_lwvm_dynamic.py
+          bash devices/a5/tests/test-pcless-rollback.sh
