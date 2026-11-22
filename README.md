@@ -12,8 +12,10 @@ Experimental native Linux research for legacy Apple iPad hardware, beginning wit
 ## Research and review
 
 - [32 GB NAND readiness research](docs/research/2026-11-22-32gb-nand-readiness.md)
-- [Independent safety review — blocking issues](docs/reviews/2026-11-22-ppn-diagnostic-independent-review.md)
-- [Cumulative engineering patch (WIP)](patches/0007-cumulative-32gb-nand-and-hardened-ppn-diag.patch)
+- [Initial independent safety review](docs/reviews/2026-11-22-ppn-diagnostic-independent-review.md)
+- [Updated review of incremental 0008 — build provenance still blocked](docs/reviews/2026-11-22-ppn-incremental-0008.md)
+- [Cumulative engineering patch 0007 (WIP)](patches/0007-cumulative-32gb-nand-and-hardened-ppn-diag.patch)
+- [Incremental correction patch 0008 (WIP)](patches/0008-fix-exact-firmware-full-geometry-and-no-fallback.patch)
 
 The patch is a **downstream diff**, not a self-contained build tree. Its application depends on the upstream Project Cascadia baseline and earlier downstream work. The documented physical 32 GB profile is **unknown**; synthetic tests cannot substitute for on-device read-only identification and offline media verification.
 
