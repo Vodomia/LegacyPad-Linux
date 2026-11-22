@@ -1,18 +1,22 @@
 # Candidate RAM Linux Image Audit & Tooling Import
 
 **Target Device:** Apple iPad mini 1 (`iPad2,5` / A1432 / P105AP, Apple A5, 32 GB NAND, iOS 8.4.1 Build: `12H321`)  
-**Status:** Host-only verified candidate build. **No files transferred to iPad; zero NAND operations.**
+**Status:** Host-only verified candidate build. **No files transferred to iPad; physical hardware trials strictly gated.**
 
 ---
 
-## 1. Overview & Objective
+## 1. Overview & Operational Model
 
 This deliverable implements the safe, host-only custom RAM Linux image experiment mandated by `GEMINI-PERSISTENCE-32GB-AUDIT.md`:
 1. Preserves the known-good working PC-less boot files bit-for-bit with an immutable hash manifest.
-2. Integrates a lightweight, non-secret diagnostic utility (`/usr/bin/legacypad-status`) into the RAM root overlay.
+2. Integrates an enhanced, non-secret diagnostic utility ([`/usr/bin/legacypad-status`](devices/a5/overlay/usr/bin/legacypad-status)) with dynamic network detection (`wlan0`/`usb0`/`eth0`) and runtime NAND write-lock validation into the RAM root overlay.
 3. Packages a separate candidate bundle (`output/candidate-staging-bundle.bin`) and candidate boot files (`build/p105/pcless-candidate/`).
-4. Verifies the candidate image with the C round-trip verifier (`test-pcless.c`) and validates all iBEC load buffer and 40 MiB heap headroom constraints.
-5. Imports the sanitized, POSIX `/bin/sh`-compatible `p105-pcless.sh` installer, rollback test suite, and dynamic LwVM test suite into this repository.
+4. Verifies the candidate image with the native C round-trip verifier (`test-pcless.c`) and validates all iBEC load buffer and 40 MiB heap headroom constraints.
+5. Imports the sanitized, POSIX `/bin/sh`-compatible [`p105-pcless.sh`](devices/a5/tools/p105-pcless.sh) installer, [`test-pcless-rollback.sh`](devices/a5/tests/test-pcless-rollback.sh) test suite (11/11 scenarios), [`lwvm.py`](devices/a5/tools/nand-volume/lwvm.py), and [`test_lwvm_dynamic.py`](devices/a5/tools/nand-volume/test_lwvm_dynamic.py) into this repository.
+
+### Storage Operational Distinction: Host Install vs. Runtime RAM Linux
+- **Host-Side Installation:** The preparatory installation command writes the 6 bootchain files (`/kernelcache`, `/ramdisk`, `/devicetree`, `/usr/local/cascadia/*`, `/usr/bin/linux`) directly to the iPad's iOS System partition (HFS+ volume on NAND).
+- **Runtime Linux:** Once booted via `kloader` -> patched `iBEC.upgrade`, the entire Linux operating system resides in RAM (`root=/dev/ram0`). Runtime NAND write permissions are strictly locked and unconfigured.
 
 ---
 
@@ -35,12 +39,12 @@ Candidate boot artifacts built independently in `devices/a5/build/p105/pcless-ca
 
 | Artifact | Size (Bytes) | SHA-256 Checksum | Delta vs. Known-Good |
 | :--- | ---: | :--- | ---: |
-| `kernelcache` | 33,588,764 | `75cb9305d9c72b600e47164e6af84ecdc9305416c95d7d12554f5b04945fdc10` | +1,152 bytes |
+| `kernelcache` | 33,605,468 | `8e1cc0d7143142040c7dabbc7a6b4d156b76f3f99cb7640a676505f0f3dfcf87` | +17,856 bytes |
 | `ramdisk` | 4,188 | `22459577003a9dbd6e92c132371e321098044e711b507709ad09b09176008dd8` | Identical |
 | `devicetree` | 79,328 | `9abf1a5f73a824bf2652909ec24584ecaff09c725bbea80bfa20b833ccf6b6dd` | Identical |
 | `iBEC.upgrade` | 282,624 | `ede34b70bf7f8a7f819f1e6a96c94f4f0ecc2c060af4dfe61ffe7a363f7865ef` | Identical |
 | `linux` | 801 | `d0edb18aae8cf681cac8a2551348a40f70c6fb2b4753bff314899f5890efbafe` | Identical |
-| `candidate-bundle.bin` | 29,852,160 | `a94ba00e578d06cbf782ca932ea4ddcaeeb750bc9735befcc46df8c79bf9b62c` | +1,024 bytes |
+| `candidate-bundle.bin` | 29,867,008 | `1859c778b5a3b72fa0e230af7c281c6f49d499534ffaa7c9e45af8fa9adcb456` | +15,872 bytes |
 
 ---
 
@@ -49,10 +53,10 @@ Candidate boot artifacts built independently in `devices/a5/build/p105/pcless-ca
 ### 3.1 C Verifier Round-Trip Test (`test-pcless.c`)
 The candidate image was tested through the native C unwrap/assemble/rewrap test harness:
 ```text
-ok   unwrap(kernelcache) == bundle (29852160 bytes)
-     layer at 0x1b55000, 1192448 bytes (includes /usr/bin/legacypad-status)
-ok   assemble(loader, zImage-dtb, layer) == bundle (29852160 bytes)
-ok   wrap(bundle) == kernelcache (33588764 bytes)
+ok   unwrap(kernelcache) == bundle (29867008 bytes)
+     layer at 0x1b55000, 1207296 bytes (includes /usr/bin/legacypad-status and /usr/bin/legacypad-power)
+ok   assemble(loader, zImage-dtb, layer) == bundle (29867008 bytes)
+ok   wrap(bundle) == kernelcache (33605468 bytes)
 PASS
 ```
 
@@ -64,57 +68,59 @@ PASS
 
 ### 3.3 iBEC Memory Bounds & Headroom
 - **Mach-O Segment Limit:** `0x80000000 .. 0x81C79000` (Load buffer begins at `0x84000000`). Headroom: **35.53 MiB**.
-- **iBEC Load Limit (`LOAD_MAX`):** `33,588,764 bytes` vs. `66,060,288 bytes` (`0x3F00000`). Headroom: **30.97 MiB**.
-- **iBEC Heap Room (`HEAP_ROOM`):** `complzss` compressed body is `33,588,288 bytes` (32.03 MiB) vs. `41,943,040 bytes` (40.00 MiB limit). **Headroom remaining: 7.97 MiB (`8,354,752 bytes`)**.
+- **iBEC Load Limit (`LOAD_MAX`):** `33,605,468 bytes` vs. `66,060,288 bytes` (`0x3F00000`). Headroom: **30.95 MiB**.
+- **iBEC Heap Room (`HEAP_ROOM`):** `complzss` compressed body is `33,605,024 bytes` (32.05 MiB) vs. `41,943,040 bytes` (40.00 MiB limit). **Headroom remaining: 7.95 MiB (`8,338,016 bytes`)**.
 
 ---
 
 ## 4. Candidate Utility: `/usr/bin/legacypad-status`
 
-Integrated at `devices/a5/overlay/usr/bin/legacypad-status`:
-```sh
-#!/bin/sh
-# legacypad-status -- Lightweight runtime diagnostic for LegacyPad / Cascadia RAM Linux
-# Reports hardware model, uptime, memory, storage mount, and network interface status.
-echo "=================================================="
-echo " LegacyPad RAM Linux (32 GB iPad mini 1 / P105AP)"
-echo " Host Kernel:  $(uname -srm 2>/dev/null || uname -a)"
-echo " System Time:  $(date -u 2>/dev/null || echo 'Unknown')"
-echo " Memory Free:  $(free -m 2>/dev/null | awk 'NR==2{print $4 " MB free of " $2 " MB total"}')"
-echo " Storage Root: $(awk '$2=="/"{print $1 " on " $2 " (" $3 ")"}' /proc/mounts 2>/dev/null)"
-echo " IP Address:   $(ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' || echo 'N/A')"
-echo " Status:       Immutable RAM root active; NAND write locked"
-echo "=================================================="
-```
+Updated at `devices/a5/overlay/usr/bin/legacypad-status` with dynamic interface querying (`wlan0`, `usb0`, `eth0`) and runtime verification of `/proc/cmdline` and `/proc/mounts`:
+- Dynamically parses `ip` and `ifconfig` for active IPv4 interfaces.
+- Verifies that `/` is mounted on `/dev/ram0`.
+- Verifies that zero NAND write flags exist in kernel arguments and zero writable NAND block devices are mounted.
 
 ---
 
-## 5. Sanitized Tooling Imported to Repository
+## 5. Tooling & Test Suite Summary
 
-1. `devices/a5/tools/p105-pcless.sh`:
+1. [`devices/a5/tools/p105-pcless.sh`](devices/a5/tools/p105-pcless.sh):
    - Pure POSIX shell syntax for Darwin `/bin/sh` compatibility (no `basename`, `grep`, `cut`, `awk` dependencies on iOS).
-   - Atomic manifest tracking and automatic rollback on interrupted transfers.
+   - Preserves `OUT` environment variable when deploying candidate or baseline images.
+   - Transactional update mode: creates `$BK/previous/` backup before activating new files while keeping original `$BK/*.orig` untouched.
+   - Dedicated `rollback` command to swap active files back to the previous version.
    - Host-side sysctl validation (`hw.machine=iPad2,5`, `kern.osversion=12H321`).
    - Clean GPL-2.0-only header and attribution.
-2. `devices/a5/tests/test-pcless-rollback.sh`:
-   - 7/7 comprehensive rollback test scenarios executed under `dash` / `sh` with an isolated minimal PATH (banned external utilities completely shadowed).
-3. `devices/a5/tools/nand-volume/test_lwvm_dynamic.py`:
+2. [`devices/a5/tests/test-pcless-rollback.sh`](devices/a5/tests/test-pcless-rollback.sh):
+   - 11/11 comprehensive test scenarios executed under `dash` / `sh` with an isolated minimal PATH (banned external utilities completely shadowed).
+   - Verifies install, update, rollback, remove, mid-transfer abort, and `OUT` preservation.
+3. [`devices/a5/tools/nand-volume/test_lwvm_dynamic.py`](devices/a5/tools/nand-volume/test_lwvm_dynamic.py):
    - 6/6 dynamic LwVM tests verifying 16 GB regression, 32 GB 32 MiB chunk scaling, and strict rejection of corrupt magic, CRC, bound overruns, and overlaps.
+   - Self-contained in repository with [`lwvm.py`](devices/a5/tools/nand-volume/lwvm.py).
 
 ---
 
-## 6. Safe Deployment & Rollback Protocol (Pending User Approval)
+## 6. Safe Deployment & On-Device Boot Recovery Protocol (Pending User Approval)
 
-When the owner explicitly authorizes physical testing:
-1. **Activation Command:**
+When physical testing is explicitly authorized by the owner:
+1. **Deployment Command (Safe Update):**
    ```bash
    OUT=devices/a5/build/p105/pcless-candidate ./devices/a5/tools/p105-pcless.sh install
    ```
 2. **Execution on iPad:**
-   Run `linux` as root in MobileTerminal/SSH; press Home once when screen turns black.
-   Verify `/usr/bin/legacypad-status`.
-3. **Instant Rollback if Needed:**
-   To restore the verified baseline image at any time:
+   Run `linux` as root in MobileTerminal or SSH; press Home once when screen turns black.
+3. **Reverting to Previous Version:**
    ```bash
-   OUT=devices/a5/build/p105/pcless-known-good ./devices/a5/tools/p105-pcless.sh install
+   ./devices/a5/tools/p105-pcless.sh rollback
    ```
+4. **Reverting to Stock iOS (Complete Clean Removal):**
+   ```bash
+   ./devices/a5/tools/p105-pcless.sh remove
+   ```
+
+### On-Device Boot Hang / Crash Recovery Plan
+If Linux halts during boot before userspace or networking is active:
+1. **Hard Cold Reboot:** Hold **Power + Home** buttons simultaneously for 10 seconds until the Apple logo appears.
+2. **Native iOS Boot:** Apple SecureROM and iBoot resume normal boot without kloader intervention, returning the device to iOS 8.4.1.
+3. **iOS Access:** Reconnect via Wi-Fi SSH or MobileTerminal to review `/var/log/cascadia-linux.log` or execute rollback/remove.
+4. **DFU Recovery (Worst Case):** Enter DFU mode (Power+Home 10s, release Power, hold Home 10s) and restore with `iPad2,5_8.4.1_12H321_Restore.ipsw`.

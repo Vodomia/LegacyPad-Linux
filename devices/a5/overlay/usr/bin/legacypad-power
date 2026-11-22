@@ -1,0 +1,261 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# legacypad-power -- Comprehensive Battery, PMU Charging, and Power Balance Diagnostic Utility
+# Developed for LegacyPad-Linux (iPad mini 1 / A1432 / P105AP)
+
+set -e
+
+SYSFS_BAT="/sys/class/power_supply/battery"
+SYSFS_PMU="/sys/class/power_supply/apple-pmu-usb"
+PARAM_ARMED="/sys/module/apple_pmu_charger/parameters/armed"
+PARAM_MAX="/sys/module/apple_pmu_charger/parameters/max_input_ma"
+PARAM_SAG_RETRY="/sys/module/apple_pmu_charger/parameters/sag_retry_sec"
+
+read_sysfs_int() {
+    file="$1"
+    def="${2:-0}"
+    if [ -r "$file" ]; then
+        val=$(cat "$file" 2>/dev/null || echo "$def")
+        echo "${val:-$def}"
+    else
+        echo "$def"
+    fi
+}
+
+read_sysfs_str() {
+    file="$1"
+    def="${2:-Unknown}"
+    if [ -r "$file" ]; then
+        val=$(cat "$file" 2>/dev/null || echo "$def")
+        echo "${val:-$def}"
+    else
+        echo "$def"
+    fi
+}
+
+show_status() {
+    bat_present=$(read_sysfs_int "$SYSFS_BAT/present" 0)
+    bat_status=$(read_sysfs_str "$SYSFS_BAT/status" "Unknown")
+    bat_cap=$(read_sysfs_int "$SYSFS_BAT/capacity" -1)
+    raw_cur=$(read_sysfs_int "$SYSFS_BAT/current_now" 0)
+    raw_volt=$(read_sysfs_int "$SYSFS_BAT/voltage_now" 0)
+    raw_temp=$(read_sysfs_int "$SYSFS_BAT/temp" 0)
+    raw_charge_now=$(read_sysfs_int "$SYSFS_BAT/charge_now" 0)
+    raw_charge_full=$(read_sysfs_int "$SYSFS_BAT/charge_full" 0)
+    raw_charge_design=$(read_sysfs_int "$SYSFS_BAT/charge_full_design" 4490000)
+    cycle_count=$(read_sysfs_int "$SYSFS_BAT/cycle_count" -1)
+
+    pmu_online=$(read_sysfs_int "$SYSFS_PMU/online" 0)
+    raw_pmu_limit=$(read_sysfs_int "$SYSFS_PMU/input_current_limit" 0)
+    is_armed=$(read_sysfs_str "$PARAM_ARMED" "N/A")
+    max_input=$(read_sysfs_int "$PARAM_MAX" 1000)
+    sag_retry=$(read_sysfs_int "$PARAM_SAG_RETRY" 60)
+
+    bat_cur_ma=$((raw_cur / 1000))
+    bat_volt_mv=$((raw_volt / 1000))
+    pmu_limit_ma=$((raw_pmu_limit / 1000))
+    charge_now_mah=$((raw_charge_now / 1000))
+    charge_full_mah=$((raw_charge_full / 1000))
+    charge_design_mah=$((raw_charge_design / 1000))
+
+    # Voltage formatted
+    volt_int=$((bat_volt_mv / 1000))
+    volt_dec=$(( (bat_volt_mv % 1000) / 10 ))
+    volt_fmt="${volt_int}.$(printf "%02d" "$volt_dec") V"
+
+    # Temperature formatted
+    temp_int=$((raw_temp / 10))
+    temp_dec=$((raw_temp % 10))
+    [ "$temp_dec" -lt 0 ] && temp_dec=$((-temp_dec))
+    temp_fmt="${temp_int}.${temp_dec} °C"
+
+    echo "================================================================"
+    echo " LegacyPad Power & PMU Charging Monitor"
+    echo " Hardware: Apple iPad mini 1 (p105ap) | PMU: Dialog D1946"
+    echo "================================================================"
+
+    # Battery Section
+    echo " [Battery Gauge - TI bq27540 (UART5 HDQ)]"
+    if [ "$bat_cap" -ge 0 ]; then
+        echo "   State of Charge:    ${bat_cap}% (${charge_now_mah} mAh / ${charge_full_mah} mAh full)"
+        echo "   Battery Status:     ${bat_status}"
+        if [ "$bat_cur_ma" -gt 0 ]; then
+            echo "   Average Current:    +${bat_cur_ma} mA (CHARGING into battery)"
+        elif [ "$bat_cur_ma" -lt 0 ]; then
+            echo "   Average Current:    ${bat_cur_ma} mA (DISCHARGING from battery)"
+        else
+            echo "   Average Current:    0 mA (Idle)"
+        fi
+        echo "   Terminal Voltage:   ${volt_fmt} (${bat_volt_mv} mV)"
+        echo "   Cell Temperature:   ${temp_fmt}"
+        [ "$cycle_count" -ge 0 ] && echo "   Health / Cycles:    ${cycle_count} cycles (Design: ${charge_design_mah} mAh)"
+    else
+        echo "   Battery Status:     Gauge not answering or driver unprobed"
+    fi
+    echo ""
+
+    # PMU USB Section
+    echo " [PMU Input Current - Dialog D1946 (0x3d)]"
+    if [ "$pmu_online" -eq 1 ]; then
+        echo "   VBUS Cable:         CONNECTED (Power source present)"
+        echo "   Input Current Limit: ${pmu_limit_ma} mA (${raw_pmu_limit} uA) [Live PMU Reg 0x3d via driver sysfs]"
+        echo "   Driver State:       Armed=${is_armed} | MaxTarget=${max_input} mA | SagRetry=${sag_retry}s"
+    else
+        echo "   VBUS Cable:         DISCONNECTED (Running exclusively on battery)"
+        echo "   Driver State:       Armed=${is_armed} | Standby"
+    fi
+    echo ""
+
+    # Health & Warning Analysis
+    echo " [Power Health & Balance Assessment]"
+    warn_state=0
+    if [ "$pmu_online" -eq 1 ]; then
+        if [ "$bat_cur_ma" -lt 0 ]; then
+            warn_state=1
+            echo "   [!] CRITICAL ALARM: BATTERY IS DRAINING ON CABLE!"
+            echo "       Current Deficit: ${bat_cur_ma} mA (Net battery drain)"
+            echo "       Input Limit:    ${pmu_limit_ma} mA (Likely clamped at 100 mA due to VBUS sag)"
+            echo "       Active Draw:    System consumes ~385-510 mA, exceeding 100 mA input."
+            echo "       --> ACTION REQUIRED:"
+            echo "           1. Disconnect from weak PC USB port."
+            echo "           2. Connect to genuine 10W/12W/20W Apple iPad wall adapter."
+            echo "           3. Or reset sag limit: legacypad-power --reset-sag"
+        elif [ "$pmu_limit_ma" -le 100 ]; then
+            warn_state=1
+            echo "   [!] WARNING: PMU INPUT CLAMPED TO 100 mA (SAG BACKOFF ACTIVE)"
+            echo "       Source voltage dipped during ramp. Device is at risk of discharge under load."
+            echo "       Sag recovery timer will retry in <= ${sag_retry}s."
+        elif [ "$bat_cur_ma" -ge 0 ] && [ "$bat_cur_ma" -lt 50 ]; then
+            echo "   [?] CAUTION: Marginal charging rate (+${bat_cur_ma} mA)."
+            echo "       Charging is very slow; battery may drain if CPU or display load increases."
+        else
+            echo "   [+] HEALTHY: Device is actively charging (+${bat_cur_ma} mA net into battery)."
+            echo "       Power supply is adequate."
+        fi
+    else
+        if [ "$bat_cap" -ge 0 ] && [ "$bat_cap" -le 10 ]; then
+            warn_state=2
+            echo "   [!] CRITICAL: Low battery (${bat_cap}%)! Connect to wall charger immediately."
+        else
+            echo "   [*] Operating normally on battery power (${bat_cur_ma} mA active load)."
+        fi
+    fi
+
+    # Temperature protection warning
+    if [ "$raw_temp" -ge 450 ]; then
+        echo "   [!] THERMAL WARNING: Battery temperature high (${temp_fmt} >= 45.0 °C)."
+        echo "       Driver will derate input current to 100 mA until cooled below 40.0 °C."
+    fi
+
+    echo "================================================================"
+    return $warn_state
+}
+
+reset_sag() {
+    target_ma="${1:-1000}"
+    target_ua=$((target_ma * 1000))
+    echo "Attempting to reset PMU sag latch to ${target_ma} mA (${target_ua} uA)..."
+    if [ -w "$SYSFS_PMU/input_current_limit" ]; then
+        echo "$target_ua" > "$SYSFS_PMU/input_current_limit"
+        echo "Successfully requested ${target_ma} mA to $SYSFS_PMU/input_current_limit."
+        echo "Waiting 1 second for driver ramp..."
+        sleep 1
+        show_status
+    else
+        echo "Error: $SYSFS_PMU/input_current_limit is not writable." >&2
+        return 1
+    fi
+}
+
+run_check() {
+    pmu_online=$(read_sysfs_int "$SYSFS_PMU/online" 0)
+    raw_cur=$(read_sysfs_int "$SYSFS_BAT/current_now" 0)
+    raw_pmu_limit=$(read_sysfs_int "$SYSFS_PMU/input_current_limit" 0)
+    bat_cap=$(read_sysfs_int "$SYSFS_BAT/capacity" 100)
+    bat_cur_ma=$((raw_cur / 1000))
+    pmu_limit_ma=$((raw_pmu_limit / 1000))
+
+    if [ "$pmu_online" -eq 1 ]; then
+        if [ "$bat_cur_ma" -lt 0 ] || [ "$pmu_limit_ma" -le 100 ]; then
+            return 1
+        fi
+    else
+        if [ "$bat_cap" -le 5 ]; then
+            return 2
+        fi
+    fi
+    return 0
+}
+
+run_watch() {
+    interval="${1:-2}"
+    while true; do
+        if type clear >/dev/null 2>&1; then
+            clear
+        else
+            printf "\033[2J\033[H"
+        fi
+        show_status || true
+        echo "Press Ctrl+C to exit. Refreshing every ${interval}s..."
+        sleep "$interval"
+    done
+}
+
+run_daemon() {
+    interval=15
+    drain_count=0
+    echo "Starting legacypad-power charging watchdog (interval: ${interval}s)..."
+    while true; do
+        pmu_online=$(read_sysfs_int "$SYSFS_PMU/online" 0)
+        raw_cur=$(read_sysfs_int "$SYSFS_BAT/current_now" 0)
+        raw_pmu_limit=$(read_sysfs_int "$SYSFS_PMU/input_current_limit" 0)
+        bat_cur_ma=$((raw_cur / 1000))
+        pmu_limit_ma=$((raw_pmu_limit / 1000))
+
+        if [ "$pmu_online" -eq 1 ] && [ "$bat_cur_ma" -lt 0 ]; then
+            drain_count=$((drain_count + 1))
+            if [ "$drain_count" -ge 2 ]; then
+                msg="legacypad-power: [CRITICAL ALARM] Battery is DISCHARGING on cable (${bat_cur_ma} mA, limit: ${pmu_limit_ma} mA)! Connect to 10W+ wall charger!"
+                echo "$msg" >&2
+                if [ -w /dev/kmsg ]; then
+                    echo "<2>$msg" > /dev/kmsg 2>/dev/null || true
+                fi
+                if type logger >/dev/null 2>&1; then
+                    logger -p user.crit "$msg" 2>/dev/null || true
+                fi
+            fi
+        else
+            drain_count=0
+        fi
+        sleep "$interval"
+    done
+}
+
+case "${1:-}" in
+    -w|--watch)
+        run_watch "${2:-2}"
+        ;;
+    -c|--check)
+        run_check
+        ;;
+    -r|--reset-sag)
+        reset_sag "${2:-1000}"
+        ;;
+    -d|--daemon)
+        run_daemon
+        ;;
+    -h|--help)
+        echo "Usage: legacypad-power [OPTIONS]"
+        echo "Options:"
+        echo "  (no args), --status   Display full battery, PMU charging, and power balance report"
+        echo "  -w, --watch [SEC]     Continuously watch power metrics (default 2s interval)"
+        echo "  -c, --check           Script check mode: exit 0=healthy, 1=cable drain/sag, 2=low bat"
+        echo "  -r, --reset-sag [mA]  Explicitly reset PMU sag latch to target mA (default 1000)"
+        echo "  -d, --daemon          Run background monitoring watchdog; alerts to kmsg/syslog on drain"
+        echo "  -h, --help            Show this help text"
+        exit 0
+        ;;
+    *)
+        show_status
+        ;;
+esac

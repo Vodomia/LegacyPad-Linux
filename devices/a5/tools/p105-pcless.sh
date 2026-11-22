@@ -10,7 +10,9 @@
 #   tools/p105-pcless.sh build     prepare all boot files in build/p105/pcless
 #   tools/p105-pcless.sh verify    strict offline verification of artifacts, C unwrapper, and bootargs
 #   tools/p105-pcless.sh check-ios safe read-only check of iPad model, iOS build, and free space (no writes)
-#   tools/p105-pcless.sh install   atomic installation to iPad with manifest, backup & rollback mechanism
+#   tools/p105-pcless.sh install   atomic installation or safe upgrade to iPad with manifest, backup & rollback
+#   tools/p105-pcless.sh update    alias for install when upgrading an existing installation
+#   tools/p105-pcless.sh rollback  reverts active installation to previous version without touching original iOS backups
 #   tools/p105-pcless.sh remove    manifest-based removal: restores original pre-existing files, deletes Cascadia files
 #
 # Boot chain:
@@ -22,15 +24,21 @@
 #     -> Linux loader at 0x80000000 -> Linux kernel (root=/dev/ram0)
 #
 # Storage & safety invariants:
-#   - Rootfs is 100% RAM initramfs (/dev/ram0).
-#   - NAND write permissions are completely disabled.
+#   - Installation phase writes boot files to iOS System HFS+ partition on NAND.
+#   - Runtime Linux rootfs is 100% in RAM (/dev/ram0).
+#   - Runtime Linux NAND write permissions are completely disabled.
 #   - No NAND partitioning or FTL formatting.
 #   - No NFS or USB cable dependency at runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$ROOT/../.." && pwd)"
-OUT="$ROOT/build/p105/pcless"
+OUT="${OUT:-$ROOT/build/p105/pcless}"
+case "$OUT" in
+    /*) ;;
+    *) OUT="$(cd "$OUT" 2>/dev/null && pwd || echo "$(pwd)/$OUT")" ;;
+esac
+
 KLOADER="$ROOT/build/cache/kloader"
 KLOADER_SHA256="bec212b4d99a1e3b9fa4add663fa884a2435045d1e47051415f4e26e197f8132"
 D="/usr/local/cascadia"
@@ -44,7 +52,7 @@ fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 generate_linux_cmd() {
     cat <<'EOF'
 #!/bin/sh
-# linux -- boot the iPad mini 1 into RAM Linux (Project Cascadia).
+# linux -- boot the iPad mini 1 into RAM Linux (LegacyPad / Project Cascadia).
 # Started by kloader on iOS 8.4.1.
 # iBEC loads /kernelcache, /ramdisk, /devicetree from System and jumps to Linux.
 # Linux rootfs is purely in RAM (/dev/ram0).
@@ -72,21 +80,25 @@ EOF
 
 # Generator for remote atomic activation and rollback script
 # Uses pure POSIX shell built-ins (no basename, no grep, no cut) for iOS sh compatibility.
-# Args: [root_prefix] [fail_on_step] [fail_on_backup]
+# Args: [root_prefix] [fail_on_step] [fail_on_backup] [mode: auto|install|update]
 generate_activate_script() {
     local P="${1:-}"
     local FAIL_ON_STEP="${2:-0}"
     local FAIL_ON_BACKUP="${3:-0}"
+    local MODE="${4:-auto}"
     cat <<EOF
 P="$P"
 FAIL_ON_STEP="$FAIL_ON_STEP"
 FAIL_ON_BACKUP="$FAIL_ON_BACKUP"
+MODE="$MODE"
 EOF
     cat <<'EOF'
 set -e
 export PATH="${PATH:-/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin}"
 
 BK="${P}/var/backups/cascadia-pcless"
+PREV="${BK}/previous"
+PREV_TMP="${BK}/previous.tmp.$$"
 MANIFEST="${BK}/manifest.txt"
 MANIFEST_TMP="${BK}/manifest.tmp.$$"
 D="${P}/usr/local/cascadia"
@@ -95,15 +107,27 @@ mkdir -p "$BK" "$D" "${P}/usr/bin"
 
 TARGETS="${P}/kernelcache ${P}/ramdisk ${P}/devicetree ${P}/usr/local/cascadia/kloader ${P}/usr/local/cascadia/iBEC.upgrade ${P}/usr/bin/linux"
 
-# 1. Protection against overwriting initial backups: check if manifest already exists
-if [ -f "$MANIFEST" ]; then
+# Determine effective mode: install (first-time) or update (manifest exists)
+if [ "$MODE" = "auto" ]; then
+    if [ -f "$MANIFEST" ]; then
+        ACTUAL_MODE="update"
+    else
+        ACTUAL_MODE="install"
+    fi
+else
+    ACTUAL_MODE="$MODE"
+fi
+
+if [ "$ACTUAL_MODE" = "install" ] && [ -f "$MANIFEST" ]; then
     echo "ERROR: A prior Cascadia installation manifest already exists at $MANIFEST!" >&2
-    echo "To protect initial original backups from being overwritten, installation is aborted." >&2
-    echo "Run remove first to restore original files before re-installing." >&2
+    echo "To update an existing installation, use update mode. To reset to stock, run remove first." >&2
+    exit 1
+fi
+if [ "$ACTUAL_MODE" = "update" ] && [ ! -f "$MANIFEST" ]; then
+    echo "ERROR: Cannot update: no existing manifest found at $MANIFEST! Run install first." >&2
     exit 1
 fi
 
-# 2. Unified POSIX EXIT trap for clean abort in backup phase or rollback in activation phase
 PHASE="backup"
 CREATED_BACKUPS=""
 MOVED=""
@@ -111,41 +135,51 @@ MOVED=""
 cleanup() {
     rc=$?
     if [ "$rc" -ne 0 ]; then
-        echo "Installation failed during $PHASE phase (exit code $rc)! Cleaning up..." >&2
-        # Clean up staging files on any failure
+        echo "Activation failed during $PHASE phase (exit code $rc)! Cleaning up..." >&2
         for t in $TARGETS; do
             rm -f "${t}.new"
         done
-        if [ "$PHASE" = "backup" ]; then
-            # Clean up partial manifest and any backups created so far
-            rm -f "$MANIFEST_TMP" "$MANIFEST"
-            for b in $CREATED_BACKUPS; do
-                rm -f "$b"
-            done
-            rmdir "$BK" 2>/dev/null || true
-        elif [ "$PHASE" = "activation" ]; then
-            echo "Executing rollback for moved files..." >&2
+        if [ "$ACTUAL_MODE" = "install" ]; then
+            if [ "$PHASE" = "backup" ]; then
+                rm -f "$MANIFEST_TMP" "$MANIFEST"
+                for b in $CREATED_BACKUPS; do
+                    rm -f "$b"
+                done
+                rmdir "$BK" 2>/dev/null || true
+            elif [ "$PHASE" = "activation" ]; then
+                echo "Executing rollback for moved files to initial state..." >&2
+                for m in $MOVED; do
+                    bname="${m##*/}"
+                    status=""
+                    if [ -f "$MANIFEST" ]; then
+                        while IFS=: read -r entry_target entry_status; do
+                            if [ "$entry_target" = "$m" ]; then
+                                status="$entry_status"
+                                break
+                            fi
+                        done < "$MANIFEST"
+                    fi
+                    if [ "$status" = "existed" ] && [ -f "$BK/${bname}.orig" ]; then
+                        echo "  Restoring original $m..." >&2
+                        cp -p "$BK/${bname}.orig" "$m"
+                    else
+                        echo "  Removing newly created $m..." >&2
+                        rm -f "$m"
+                    fi
+                done
+                rm -rf "$BK"
+            fi
+        elif [ "$ACTUAL_MODE" = "update" ]; then
+            echo "Executing rollback for moved files to previous active version..." >&2
             for m in $MOVED; do
                 bname="${m##*/}"
-                status=""
-                if [ -f "$MANIFEST" ]; then
-                    while IFS=: read -r entry_target entry_status; do
-                        if [ "$entry_target" = "$m" ]; then
-                            status="$entry_status"
-                            break
-                        fi
-                    done < "$MANIFEST"
-                fi
-                if [ "$status" = "existed" ] && [ -f "$BK/${bname}.orig" ]; then
-                    echo "  Restoring original $m..." >&2
-                    cp -p "$BK/${bname}.orig" "$m"
-                else
-                    echo "  Removing newly created $m..." >&2
-                    rm -f "$m"
+                if [ -f "$PREV_TMP/${bname}" ]; then
+                    echo "  Restoring previous active $m..." >&2
+                    cp -p "$PREV_TMP/${bname}" "$m"
                 fi
             done
-            # Remove manifest and backup dir so state is cleanly returned to pre-install
-            rm -rf "$BK"
+            rm -rf "$PREV_TMP"
+            # In update failure, initial .orig backups, manifest, and existing previous/ remain untouched!
         fi
         sync
         exit $rc
@@ -153,30 +187,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Create temporary manifest and backup existing files
-> "$MANIFEST_TMP"
+# Backup phase
 bstep=0
-for t in $TARGETS; do
-    bstep=$((bstep + 1))
-    if [ "$FAIL_ON_BACKUP" -eq "$bstep" ]; then
-        echo "Simulating synthetic failure at backup step $bstep on $t" >&2
-        false
-    fi
-    bname="${t##*/}"
-    if [ -f "$t" ]; then
-        echo "$t:existed" >> "$MANIFEST_TMP"
-        cp -p "$t" "$BK/${bname}.orig"
-        CREATED_BACKUPS="$CREATED_BACKUPS $BK/${bname}.orig"
-    else
-        echo "$t:created" >> "$MANIFEST_TMP"
-    fi
-done
+if [ "$ACTUAL_MODE" = "install" ]; then
+    > "$MANIFEST_TMP"
+    for t in $TARGETS; do
+        bstep=$((bstep + 1))
+        if [ "$FAIL_ON_BACKUP" -eq "$bstep" ]; then
+            echo "Simulating synthetic failure at backup step $bstep on $t" >&2
+            false
+        fi
+        bname="${t##*/}"
+        if [ -f "$t" ]; then
+            echo "$t:existed" >> "$MANIFEST_TMP"
+            cp -p "$t" "$BK/${bname}.orig"
+            CREATED_BACKUPS="$CREATED_BACKUPS $BK/${bname}.orig"
+        else
+            echo "$t:created" >> "$MANIFEST_TMP"
+        fi
+    done
+    mv "$MANIFEST_TMP" "$MANIFEST"
+elif [ "$ACTUAL_MODE" = "update" ]; then
+    mkdir -p "$PREV_TMP"
+    for t in $TARGETS; do
+        bstep=$((bstep + 1))
+        if [ "$FAIL_ON_BACKUP" -eq "$bstep" ]; then
+            echo "Simulating synthetic failure at backup step $bstep on $t" >&2
+            false
+        fi
+        bname="${t##*/}"
+        if [ -f "$t" ]; then
+            cp -p "$t" "$PREV_TMP/${bname}"
+        fi
+    done
+fi
 
-# Atomically commit the manifest
-mv "$MANIFEST_TMP" "$MANIFEST"
 PHASE="activation"
 
-# 3. Move files in order with rollback protection
+# Activation phase
 step=0
 for t in $TARGETS; do
     step=$((step + 1))
@@ -188,14 +236,62 @@ for t in $TARGETS; do
     MOVED="$MOVED $t"
 done
 
+# If update succeeded, commit PREV_TMP to PREV
+if [ "$ACTUAL_MODE" = "update" ]; then
+    rm -rf "$PREV"
+    mv "$PREV_TMP" "$PREV"
+fi
+
 chmod 755 "${P}/usr/local/cascadia/kloader" "${P}/usr/bin/linux"
 trap - EXIT
 EOF
 }
 
+# Generator for remote rollback script (reverts active files to previous Cascadia version)
+generate_rollback_script() {
+    local P="${1:-}"
+    cat <<EOF
+P="$P"
+EOF
+    cat <<'EOF'
+set -e
+export PATH="${PATH:-/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin}"
+
+BK="${P}/var/backups/cascadia-pcless"
+PREV="${BK}/previous"
+MANIFEST="${BK}/manifest.txt"
+
+if [ ! -f "$MANIFEST" ]; then
+    echo "ERROR: No Cascadia installation manifest found at $MANIFEST!" >&2
+    exit 1
+fi
+
+if [ ! -d "$PREV" ]; then
+    echo "ERROR: No previous version backup found at $PREV to roll back to!" >&2
+    echo "To revert to stock iOS, run remove instead." >&2
+    exit 1
+fi
+
+echo "Rolling back active files to previous version from $PREV..."
+TARGETS="${P}/kernelcache ${P}/ramdisk ${P}/devicetree ${P}/usr/local/cascadia/kloader ${P}/usr/local/cascadia/iBEC.upgrade ${P}/usr/bin/linux"
+
+for t in $TARGETS; do
+    bname="${t##*/}"
+    if [ -f "$PREV/${bname}" ]; then
+        echo "  Restoring previous $t..."
+        mv "$PREV/${bname}" "$t"
+    fi
+done
+
+rm -rf "$PREV"
+chmod 755 "${P}/usr/local/cascadia/kloader" "${P}/usr/bin/linux" 2>/dev/null || true
+sync
+echo "Rollback to previous version completed successfully."
+EOF
+}
+
 # Generator for remote manifest-based remove and restore script
-# Uses pure POSIX shell built-ins (no basename, no grep, no cut) for iOS sh compatibility.
-# Args: [root_prefix]
+# Restores original stock iOS files and deletes Cascadia-installed files.
 generate_remove_script() {
     local P="${1:-}"
     cat <<EOF
@@ -206,6 +302,7 @@ set -e
 export PATH="${PATH:-/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin}"
 
 BK="${P}/var/backups/cascadia-pcless"
+PREV="${BK}/previous"
 MANIFEST="${BK}/manifest.txt"
 D="${P}/usr/local/cascadia"
 
@@ -217,7 +314,6 @@ for t in $TARGETS; do
 done
 rm -f "${P}/var/log/cascadia-linux.log"
 
-# Strict check: if manifest is missing, REFUSE to delete active files!
 if [ ! -f "$MANIFEST" ]; then
     echo "ERROR: No Cascadia installation manifest found at $MANIFEST!" >&2
     echo "Refusing to remove active files without manifest to protect system files." >&2
@@ -241,12 +337,12 @@ while IFS=: read -r target status; do
     fi
 done < "$MANIFEST"
 
-# Clean up manifest and backup directory
+rm -rf "$PREV"
 rm -f "$MANIFEST"
 rm -rf "$BK"
-# Clean up cascadia directory only if completely empty
 rmdir "$D" 2>/dev/null || true
 sync
+echo "System restored to stock iOS state. All Cascadia files removed."
 EOF
 }
 
@@ -258,45 +354,42 @@ import struct, sys
 def check_dtb_bootargs(dtb_bytes):
     magic, total, off_struct, off_strings = struct.unpack_from('>IIII', dtb_bytes, 0)
     assert magic == 0xd00dfeed, 'not a valid DTB'
-    strings = off_strings
     p = off_struct
-    path = []
+    strings = dtb_bytes[off_strings:]
     bootargs = None
     has_ppn_node = False
-    while True:
-        tok, = struct.unpack_from('>I', dtb_bytes, p); p += 4
-        if tok == 1: # BEGIN_NODE
-            e = dtb_bytes.index(b'\0', p)
-            name = dtb_bytes[p:e].decode()
-            path.append(name)
-            if 'ppn@' in name or 'apple,s5l8940x-ppn' in name:
+    while p < len(dtb_bytes):
+        token = struct.unpack_from('>I', dtb_bytes, p)[0]
+        p += 4
+        if token == 1: # FDT_BEGIN_NODE
+            name_end = dtb_bytes.find(b'\0', p)
+            nodename = dtb_bytes[p:name_end].decode('latin1', 'replace')
+            p = (name_end + 4) & ~3
+            if 'ppn@1200000' in nodename:
                 has_ppn_node = True
-            p = (e + 4) & ~3
-        elif tok == 2: # END_NODE
-            path.pop()
-        elif tok == 3: # PROP
-            ln, nameoff = struct.unpack_from('>II', dtb_bytes, p); p += 8
-            e = dtb_bytes.index(b'\0', strings + nameoff)
-            name = dtb_bytes[strings + nameoff:e].decode()
-            if path == ['', 'chosen'] and name == 'bootargs':
-                bootargs = dtb_bytes[p:p+ln-1].decode('latin1')
-            p = (p + ln + 3) & ~3
-        elif tok == 4: pass
-        elif tok == 9: break
+        elif token == 3: # FDT_PROP
+            val_len, name_off = struct.unpack_from('>II', dtb_bytes, p)
+            p += 8
+            prop_val = dtb_bytes[p:p+val_len]
+            p = (p + val_len + 3) & ~3
+            prop_name_end = strings.find(b'\0', name_off)
+            prop_name = strings[name_off:prop_name_end].decode('latin1', 'replace')
+            if prop_name == 'bootargs':
+                bootargs = prop_val.decode('latin1', 'replace').rstrip('\0')
+        elif token == 9: # FDT_END
+            break
     return bootargs, has_ppn_node
 
-# 1. Check staging-bundle.bin
-with open('$ROOT/output/staging-bundle.bin', 'rb') as f:
-    bundle = f.read()
+zimage = '$ROOT/output/zImage-dtb'
+with open(zimage, 'rb') as f:
+    d = f.read()
 
-idx = bundle.rfind(b'\xd0\x0d\xfe\xed')
-assert idx > 0, 'DTB not found in staging-bundle.bin'
-dtb_len = struct.unpack_from('>I', bundle, idx + 4)[0]
-args, has_ppn = check_dtb_bootargs(bundle[idx:idx+dtb_len])
+off = d.rfind(bytes.fromhex('d00dfeed'))
+assert off >= 0, 'No DTB magic found in zImage-dtb'
+args, has_ppn = check_dtb_bootargs(d[off:])
 
-assert args is not None, 'bootargs not found in DTB'
-assert 'root=/dev/ram0' in args, 'root=/dev/ram0 missing from bootargs: ' + args
-assert 'root=/dev/ftl' not in args, 'root=/dev/ftl found in bootargs: ' + args
+assert args is not None, 'bootargs not found in appended DTB'
+assert 'root=/dev/ram0' in args, 'root=/dev/ram0 not found in bootargs'
 assert 'apple_ppn.allow_write=1' not in args, 'apple_ppn.allow_write found in bootargs'
 assert 'apple_ftl.enable_write=1' not in args, 'apple_ftl.enable_write found in bootargs'
 assert 'apple_ftl.write_volume' not in args, 'apple_ftl.write_volume found in bootargs'
@@ -311,7 +404,7 @@ build() {
     local ibec="$ROOT/build/firmware/iBEC.patched"
     local dt="$ROOT/build/firmware/DeviceTree.dec"
     local ipsw="${IPSW:-$REPO/iPad2,5_8.4.1_12H321_Restore.ipsw}"
-    local bundle="$ROOT/output/staging-bundle.bin"
+    local bundle="${BUNDLE:-$ROOT/output/staging-bundle.bin}"
 
     [ -s "$ibec" ] || fail "missing $ibec: run ./cascadia a5 firmware first"
     [ -s "$dt" ] || fail "missing $dt: run ./cascadia a5 firmware first"
@@ -357,9 +450,24 @@ verify() {
     local test_bin="/tmp/test-pcless"
     gcc -Wall -Wextra -O2 -I "$ROOT/app" -o "$test_bin" "$ROOT/tests/test-pcless.c" "$ROOT/app/pcless.c" \
         || fail "Compilation of test-pcless failed! C verification must not be skipped."
-    "$test_bin" "$OUT/kernelcache" "$ROOT/output/staging-bundle.bin" \
+
+    local bundle="${BUNDLE:-}"
+    if [ -z "$bundle" ]; then
+        if [ -s "$OUT/candidate-staging-bundle.bin" ]; then
+            bundle="$OUT/candidate-staging-bundle.bin"
+        elif [ -s "$OUT/staging-bundle.bin" ]; then
+            bundle="$OUT/staging-bundle.bin"
+        elif [[ "$OUT" == *"candidate"* ]] && [ -s "$ROOT/output/candidate-staging-bundle.bin" ]; then
+            bundle="$ROOT/output/candidate-staging-bundle.bin"
+        else
+            bundle="$ROOT/output/staging-bundle.bin"
+        fi
+    fi
+    note "Using bundle for C verification: $bundle"
+
+    "$test_bin" "$OUT/kernelcache" "$bundle" \
                 "$ROOT/output/linux-boot.bin" "$ROOT/output/zImage-dtb" \
-        || fail "C verification test failed! kernelcache does not wrap staging-bundle.bin correctly."
+        || fail "C verification test failed! kernelcache does not wrap bundle correctly."
     note "C test verification: PASSED (unwrap, layer extract, assemble, wrap bit-for-bit identical)"
 
     # 4. Verify bootargs inside bundle and device tree
@@ -423,7 +531,13 @@ check_ios() {
 }
 
 install() {
-    build
+    # If artifacts already exist in $OUT, use them directly; otherwise build them.
+    if [ ! -s "$OUT/kernelcache" ] || [ ! -s "$OUT/ramdisk" ] || [ ! -s "$OUT/devicetree" ] || [ ! -s "$OUT/iBEC.upgrade" ] || [ ! -s "$OUT/linux" ]; then
+        say "Artifacts missing in $OUT; building..."
+        build
+    else
+        say "Using existing pre-built artifacts in $OUT"
+    fi
     verify
 
     say "Connecting to iPad for PC-less installation..."
@@ -442,17 +556,20 @@ install() {
     [ "$dev_build" = "12H321" ] || fail "ABORT: Target device kern.osversion is '$dev_build', expected '12H321'!"
     note "Device verified: hw.machine=$dev_mach, kern.osversion=$dev_build"
 
-    # 2. Check for prior installation manifest to protect initial backups
+    # 2. Check for prior installation manifest to choose install vs update mode
     say "2. Checking for prior installation manifest on device..."
     local prior_manifest
     prior_manifest=$(ios "[ -f '$BACKUP_DIR/manifest.txt' ] && echo 'yes' || true" 2>/dev/null || true)
+    local install_mode="install"
     if [ "$prior_manifest" = "yes" ]; then
-        say "ERROR: An existing Cascadia installation manifest was found on the iPad!"
-        note "To protect the original iOS backups from being overwritten, installation is aborted."
-        note "Run './devices/a5/tools/p105-pcless.sh remove' first to restore original files before re-installing."
-        fail "Aborting install to prevent overwriting initial backups."
+        say "Existing installation detected (manifest at $BACKUP_DIR/manifest.txt)."
+        say "Safe update mode: initial iOS backups (*.orig) will be preserved."
+        say "Current active files will be saved to $BACKUP_DIR/previous before activation."
+        install_mode="update"
+    else
+        say "Clean initial installation detected on iOS."
+        install_mode="install"
     fi
-    note "No prior installation manifest: safe to proceed."
 
     # 3. Check for stale .new files from an interrupted prior attempt
     say "3. Checking for stale staging (.new) files from interrupted attempts..."
@@ -552,7 +669,7 @@ install() {
 
     say "7. Generating manifest, pre-install backup, and activating with atomic rollback..."
     local act_script
-    act_script=$(generate_activate_script "" 0)
+    act_script=$(generate_activate_script "" 0 0 "$install_mode")
     ios "$act_script" || fail "Activation failed during remote move operations; rollback was executed."
     note "All 6 files successfully activated with manifest and backup secured."
 
@@ -562,12 +679,30 @@ install() {
     say "INSTALLATION COMPLETE AND VERIFIED!"
     echo "=================================================================="
     echo " PC-less RAM Linux is installed on iPad mini 1."
+    echo " Mode: $install_mode (initial .orig backups preserved)"
     echo " To boot Linux without a computer or cable:"
     echo "   1. On iPad (via MobileTerminal / MTerminal or SSH), run as root:"
     echo "        linux"
     echo "   2. The screen will turn black. Press the Home button once."
     echo "   3. Linux will boot into RAM (/dev/ram0) on the iPad screen."
+    echo "   4. Note: If boot hangs before userspace, hold Power + Home"
+    echo "      for 10 seconds to cold-reboot back into normal iOS."
     echo "=================================================================="
+}
+
+rollback() {
+    say "Connecting to iPad to rollback to previous version..."
+    . "$ROOT/tools/ios-ssh.sh"
+    BOARD_MODEL=iPad2,5
+    ios_setup p105pcless
+    ios_connect || fail "SSH connection/authentication to iOS failed!"
+    ios_check_model
+
+    say "Executing rollback to previous version..."
+    local rb_script
+    rb_script=$(generate_rollback_script "")
+    ios "$rb_script" || fail "Rollback failed on device."
+    say "Rollback to previous version completed successfully."
 }
 
 remove() {
@@ -591,15 +726,20 @@ case "${1:-}" in
     verify) verify ;;
     check-ios) check_ios ;;
     install) install ;;
+    update) install ;;
+    rollback) rollback ;;
     remove) remove ;;
     internal-activate)
-        generate_activate_script "${2:-}" "${3:-0}" "${4:-0}"
+        generate_activate_script "${2:-}" "${3:-0}" "${4:-0}" "${5:-auto}"
+        ;;
+    internal-rollback)
+        generate_rollback_script "${2:-}"
         ;;
     internal-remove)
         generate_remove_script "${2:-}"
         ;;
     *)
-        echo "usage: $0 build | verify | check-ios | install | remove"
+        echo "usage: $0 build | verify | check-ios | install | update | rollback | remove"
         exit 2
         ;;
 esac

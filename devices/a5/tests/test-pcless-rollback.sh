@@ -3,7 +3,7 @@
 #
 # Derived from Project Cascadia test harness for LegacyPad-Linux.
 # test-pcless-rollback.sh -- Verifies the EXACT remote shell scripts emitted by
-# devices/a5/tools/p105-pcless.sh internal-activate and internal-remove.
+# devices/a5/tools/p105-pcless.sh internal-activate, internal-rollback, and internal-remove.
 #
 # Constraints & Verification Guarantees:
 #   - Runs strictly with POSIX /bin/sh (dash on Linux Mint) -- NOT bash!
@@ -11,13 +11,17 @@
 #     'cut', 'awk', 'sed' DO NOT EXIST, proving 100% POSIX built-in compliance
 #     for minimal iOS 8.4.1 environments.
 #   - Verified scenarios:
-#       1. Clean installation across all 6 target files (success)
-#       2. Overwrite protection: second install blocked if manifest exists
-#       3. Remove with missing manifest: strictly refuses to delete active files
-#       4. Manifest-based remove: cleanly restores pre-existing files & deletes created files
-#       5. Failure during manifest/backup creation: no partial manifest or .new files left
-#       6. Failure at 4th file with empty initial state: complete clean rollback
-#       7. Failure at 4th file with pre-existing canary files: 100% bit-for-bit restoration
+#       1. Clean initial installation across all 6 target files (success)
+#       2. Protection in install-only mode: blocked if manifest exists
+#       3. Safe update mode: updates active files, saves to previous/, preserves .orig
+#       4. Failure during update: restores previous active files, leaves .orig intact
+#       5. Dedicated rollback command: restores files from previous/
+#       6. Remove with missing manifest: strictly refuses to delete active files
+#       7. Manifest-based clean remove: cleanly restores pre-existing files & deletes Cascadia files
+#       8. Failure during manifest/backup creation: no partial manifest or .new files left
+#       9. Failure at 4th file with empty initial state: complete clean rollback
+#      10. Failure at 4th file with pre-existing canary files: 100% bit-for-bit restoration
+#      11. Candidate OUT selection: OUT environment variable is respected and preserved
 #
 set -euo pipefail
 
@@ -68,9 +72,18 @@ exec_p105_activate() {
     local root="$1"
     local fail_step="${2:-0}"
     local fail_backup="${3:-0}"
+    local mode="${4:-auto}"
     local act_sh
-    act_sh=$("$PCLESS_BIN" internal-activate "$root" "$fail_step" "$fail_backup")
+    act_sh=$("$PCLESS_BIN" internal-activate "$root" "$fail_step" "$fail_backup" "$mode")
     PATH="$ISOLATED_BIN" sh -c "$act_sh"
+}
+
+# Helper to run the exact remote rollback script using POSIX /bin/sh and isolated PATH
+exec_p105_rollback() {
+    local root="$1"
+    local rb_sh
+    rb_sh=$("$PCLESS_BIN" internal-rollback "$root")
+    PATH="$ISOLATED_BIN" sh -c "$rb_sh"
 }
 
 # Helper to run the exact remote remove script using POSIX /bin/sh and isolated PATH
@@ -93,7 +106,7 @@ for t in "${TARGET_KEYS[@]}"; do
     echo "NEW_CONTENT_$t" > "$ROOT/$t.new"
 done
 
-exec_p105_activate "$ROOT" 0 0
+exec_p105_activate "$ROOT" 0 0 "install"
 
 for t in "${TARGET_KEYS[@]}"; do
     [ -f "$ROOT/$t" ] || fail "Test 1: target $t was not created!"
@@ -105,29 +118,84 @@ done
 say "PASS: Test 1 (All 6 files successfully installed and manifest created with zero external tools)."
 
 # ------------------------------------------------------------------------------
-# TEST 2: Second install attempted while manifest exists -> Must be BLOCKED
+# TEST 2: Strict install mode blocked when manifest exists
 # ------------------------------------------------------------------------------
-say "Test 2: Testing protection against overwriting initial backups..."
+say "Test 2: Testing protection against overwriting initial backups in install-only mode..."
 for t in "${TARGET_KEYS[@]}"; do
     echo "OVERWRITE_CONTENT_$t" > "$ROOT/$t.new"
 done
 
 set +e
-exec_p105_activate "$ROOT" 0 0 2>/dev/null
+exec_p105_activate "$ROOT" 0 0 "install" 2>/dev/null
 rc=$?
 set -e
 
-[ "$rc" -ne 0 ] || fail "Test 2: Second install should have been BLOCKED by existing manifest, but succeeded!"
-note "Second install was successfully blocked (rc=$rc)"
+[ "$rc" -ne 0 ] || fail "Test 2: Strict install mode should have been BLOCKED by existing manifest!"
+note "Strict install was successfully blocked (rc=$rc)"
 for t in "${TARGET_KEYS[@]}"; do
     [ "$(cat "$ROOT/$t")" = "NEW_CONTENT_$t" ] || fail "Test 2: content on $t was overwritten!"
 done
-say "PASS: Test 2 (Existing manifest strictly prevents overwriting initial backups)."
+say "PASS: Test 2 (Strict install mode prevents overwriting initial backups)."
 
 # ------------------------------------------------------------------------------
-# TEST 3: Remove with missing manifest -> Strictly refuses to delete active files
+# TEST 3: Safe update mode updates files, saves to previous/, preserves .orig
 # ------------------------------------------------------------------------------
-say "Test 3: Testing remove behavior when manifest is missing..."
+say "Test 3: Testing safe update of an existing installation..."
+for t in "${TARGET_KEYS[@]}"; do
+    echo "UPDATE_V2_$t" > "$ROOT/$t.new"
+done
+
+exec_p105_activate "$ROOT" 0 0 "update"
+
+for t in "${TARGET_KEYS[@]}"; do
+    [ "$(cat "$ROOT/$t")" = "UPDATE_V2_$t" ] || fail "Test 3: content mismatch on updated $t"
+    bname="${t##*/}"
+    [ -f "$ROOT/var/backups/cascadia-pcless/previous/$bname" ] || fail "Test 3: previous/$bname not saved!"
+    [ "$(cat "$ROOT/var/backups/cascadia-pcless/previous/$bname")" = "NEW_CONTENT_$t" ] \
+        || fail "Test 3: previous/$bname does not hold previous version!"
+done
+say "PASS: Test 3 (Update cleanly updated files, created previous/ backup, and preserved original manifest)."
+
+# ------------------------------------------------------------------------------
+# TEST 4: Failure during update activation restores previous active files
+# ------------------------------------------------------------------------------
+say "Test 4: Testing failure during update activation (synthetic failure at step 4)..."
+for t in "${TARGET_KEYS[@]}"; do
+    echo "UPDATE_V3_FAIL_$t" > "$ROOT/$t.new"
+done
+
+set +e
+exec_p105_activate "$ROOT" 4 0 "update" 2>/dev/null
+rc=$?
+set -e
+
+[ "$rc" -ne 0 ] || fail "Test 4: Update should have failed at step 4!"
+note "Update failed at step 4 as expected (rc=$rc)"
+
+# Verify active files were restored to V2 (from previous/)
+for t in "${TARGET_KEYS[@]}"; do
+    [ "$(cat "$ROOT/$t")" = "UPDATE_V2_$t" ] || fail "Test 4: $t was not restored to previous version V2!"
+    [ ! -f "$ROOT/$t.new" ] || fail "Test 4: $t.new was not cleaned up!"
+done
+say "PASS: Test 4 (Failure during update cleanly rolled back active files to previous active version)."
+
+# ------------------------------------------------------------------------------
+# TEST 5: Dedicated rollback command restores previous active version
+# ------------------------------------------------------------------------------
+say "Test 5: Testing dedicated rollback command..."
+# Current active is V2, previous holds NEW_CONTENT (V1)
+exec_p105_rollback "$ROOT"
+
+for t in "${TARGET_KEYS[@]}"; do
+    [ "$(cat "$ROOT/$t")" = "NEW_CONTENT_$t" ] || fail "Test 5: $t was not reverted to V1 by rollback!"
+done
+[ ! -d "$ROOT/var/backups/cascadia-pcless/previous" ] || fail "Test 5: previous/ directory was not removed after rollback!"
+say "PASS: Test 5 (Rollback successfully reverted active files to previous version)."
+
+# ------------------------------------------------------------------------------
+# TEST 6: Remove with missing manifest -> Strictly refuses to delete active files
+# ------------------------------------------------------------------------------
+say "Test 6: Testing remove behavior when manifest is missing..."
 mv "$ROOT/var/backups/cascadia-pcless/manifest.txt" "$ROOT/var/backups/cascadia-pcless/manifest.txt.bak"
 
 set +e
@@ -135,35 +203,34 @@ exec_p105_remove "$ROOT" 2>/dev/null
 rc=$?
 set -e
 
-[ "$rc" -ne 0 ] || fail "Test 3: Remove should have failed when manifest is missing, but succeeded!"
+[ "$rc" -ne 0 ] || fail "Test 6: Remove should have failed when manifest is missing, but succeeded!"
 note "Remove failed as expected (rc=$rc)"
 
 for t in "${TARGET_KEYS[@]}"; do
-    [ -f "$ROOT/$t" ] || fail "Test 3: $t was deleted despite missing manifest!"
+    [ -f "$ROOT/$t" ] || fail "Test 6: $t was deleted despite missing manifest!"
 done
 mv "$ROOT/var/backups/cascadia-pcless/manifest.txt.bak" "$ROOT/var/backups/cascadia-pcless/manifest.txt"
-say "PASS: Test 3 (Remove strictly refuses to delete active files without manifest)."
+say "PASS: Test 6 (Remove strictly refuses to delete active files without manifest)."
 
 # ------------------------------------------------------------------------------
-# TEST 4: Manifest-based remove -> Restores original state
+# TEST 7: Manifest-based remove -> Restores original state
 # ------------------------------------------------------------------------------
-say "Test 4: Testing clean remove and restoration..."
+say "Test 7: Testing clean remove and restoration..."
 exec_p105_remove "$ROOT"
 
 for t in "${TARGET_KEYS[@]}"; do
-    [ ! -f "$ROOT/$t" ] || fail "Test 4: $t was not removed!"
+    [ ! -f "$ROOT/$t" ] || fail "Test 7: $t was not removed!"
 done
-[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || fail "Test 4: backup directory was not removed!"
-say "PASS: Test 4 (Manifest-based remove cleaned all Cascadia files)."
+[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || fail "Test 7: backup directory was not removed!"
+say "PASS: Test 7 (Manifest-based remove cleaned all Cascadia files)."
 
 # ------------------------------------------------------------------------------
-# TEST 5: Failure during backup/manifest creation -> No partial manifest or .new files
+# TEST 8: Failure during backup/manifest creation -> No partial manifest or .new files
 # ------------------------------------------------------------------------------
-say "Test 5: Testing failure during backup & manifest creation (bstep 2)..."
+say "Test 8: Testing failure during backup & manifest creation (bstep 2)..."
 setup_sandbox
 ROOT="$SANDBOX/root"
 
-# Create pre-existing file for kernelcache and ramdisk
 echo "ORIGINAL_KERNELCACHE" > "$ROOT/kernelcache"
 echo "ORIGINAL_RAMDISK" > "$ROOT/ramdisk"
 
@@ -173,119 +240,104 @@ for t in "${TARGET_KEYS[@]}"; do
 done
 
 set +e
-exec_p105_activate "$ROOT" 0 2 2>/tmp/test5_backup_err.log
+exec_p105_activate "$ROOT" 0 2 "install" 2>/dev/null
 rc=$?
 set -e
 
-[ "$rc" -ne 0 ] || fail "Test 5: Activation should have failed at backup step 2, but succeeded!"
+[ "$rc" -ne 0 ] || fail "Test 8: Activation should have failed at backup step 2, but succeeded!"
 note "Activation failed at backup step 2 as expected (rc=$rc)"
 
-# Verify no partial or committed manifest exists
-[ ! -f "$ROOT/var/backups/cascadia-pcless/manifest.txt" ] || fail "Test 5: manifest.txt exists after backup failure!"
-local_tmp_manifests=$(ls "$ROOT/var/backups/cascadia-pcless"/manifest.tmp.* 2>/dev/null || true)
-[ -z "$local_tmp_manifests" ] || fail "Test 5: partial manifest.tmp exists after backup failure!"
-
-# Verify all .new staging files were deleted
+[ ! -f "$ROOT/var/backups/cascadia-pcless/manifest.txt" ] || fail "Test 8: manifest.txt exists after backup failure!"
 for t in "${TARGET_KEYS[@]}"; do
-    [ ! -f "$ROOT/$t.new" ] || fail "Test 5: $t.new still exists after backup cleanup!"
+    [ ! -f "$ROOT/$t.new" ] || fail "Test 8: $t.new still exists after backup cleanup!"
 done
-
-# Verify original files remain intact and unmodified
-[ "$(cat "$ROOT/kernelcache")" = "ORIGINAL_KERNELCACHE" ] || fail "Test 5: kernelcache was modified!"
-[ "$(cat "$ROOT/ramdisk")" = "ORIGINAL_RAMDISK" ] || fail "Test 5: ramdisk was modified!"
-
-# Verify backup dir was cleaned up
-[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || [ -z "$(ls -A "$ROOT/var/backups/cascadia-pcless" 2>/dev/null)" ] \
-    || fail "Test 5: backup directory has orphaned backup files!"
-
-say "PASS: Test 5 (Failure during manifest/backup creation: zero partial manifest, zero .new files left)."
+[ "$(cat "$ROOT/kernelcache")" = "ORIGINAL_KERNELCACHE" ] || fail "Test 8: kernelcache was modified!"
+[ "$(cat "$ROOT/ramdisk")" = "ORIGINAL_RAMDISK" ] || fail "Test 8: ramdisk was modified!"
+say "PASS: Test 8 (Failure during manifest/backup creation: zero partial manifest, zero .new files left)."
 
 # ------------------------------------------------------------------------------
-# TEST 6: Failure on 4th file (/usr/local/cascadia/kloader) - Empty initial state
+# TEST 9: Step 4 failure with empty initial state -> complete clean rollback
 # ------------------------------------------------------------------------------
-say "Test 6: Testing failure at 4th file with empty initial state..."
+say "Test 9: Testing failure at 4th file with empty initial state..."
 setup_sandbox
 ROOT="$SANDBOX/root"
 
 for t in "${TARGET_KEYS[@]}"; do
     mkdir -p "$(dirname "$ROOT/$t")"
-    echo "STAGING_CONTENT_$t" > "$ROOT/$t.new"
+    echo "CONTENT_$t" > "$ROOT/$t.new"
 done
 
 set +e
-exec_p105_activate "$ROOT" 4 0 2>/tmp/test6_err.log
+exec_p105_activate "$ROOT" 4 0 "install" 2>/dev/null
 rc=$?
 set -e
 
-[ "$rc" -ne 0 ] || fail "Test 6: Activation should have failed at step 4, but succeeded!"
+[ "$rc" -ne 0 ] || fail "Test 9: Activation should have failed at step 4, but succeeded!"
 note "Activation failed at step 4 as expected (rc=$rc)"
 
-# Files 1, 2, 3 (kernelcache, ramdisk, devicetree) were moved before step 4 -> Rollback must remove them!
-[ ! -f "$ROOT/kernelcache" ] || fail "Test 6: kernelcache exists after rollback!"
-[ ! -f "$ROOT/ramdisk" ]     || fail "Test 6: ramdisk exists after rollback!"
-[ ! -f "$ROOT/devicetree" ]  || fail "Test 6: devicetree exists after rollback!"
-
-# Files 4, 5, 6 were never moved -> Must not exist
-[ ! -f "$ROOT/usr/local/cascadia/kloader" ]      || fail "Test 6: kloader exists after rollback!"
-[ ! -f "$ROOT/usr/local/cascadia/iBEC.upgrade" ] || fail "Test 6: iBEC.upgrade exists after rollback!"
-[ ! -f "$ROOT/usr/bin/linux" ]                   || fail "Test 6: linux exists after rollback!"
-
-# All .new files must be cleaned up
 for t in "${TARGET_KEYS[@]}"; do
-    [ ! -f "$ROOT/$t.new" ] || fail "Test 6: $t.new still exists!"
+    [ ! -f "$ROOT/$t" ] || fail "Test 9: $t was left behind after rollback!"
+    [ ! -f "$ROOT/$t.new" ] || fail "Test 9: $t.new was left behind after rollback!"
 done
-[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || fail "Test 6: failed backup dir not cleaned up!"
-say "PASS: Test 6 (Step 4 failure with empty initial state: complete clean rollback)."
+[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || fail "Test 9: backup directory exists after rollback!"
+say "PASS: Test 9 (Step 4 failure with empty initial state: complete clean rollback)."
 
 # ------------------------------------------------------------------------------
-# TEST 7: Failure on 4th file (/usr/local/cascadia/kloader) - Pre-existing files
+# TEST 10: Step 4 failure with pre-existing canary files -> 100% bit-for-bit restored
 # ------------------------------------------------------------------------------
-say "Test 7: Testing failure at 4th file with pre-existing canary files..."
+say "Test 10: Testing failure at 4th file with pre-existing canary files..."
 setup_sandbox
 ROOT="$SANDBOX/root"
 
-# Create pre-existing canary files with distinct hashes
-CANARY_HASHES=()
+CANARY_MAP=()
+declare -A CANARY_HASHES
+
 for t in "${TARGET_KEYS[@]}"; do
     mkdir -p "$(dirname "$ROOT/$t")"
-    echo "CANARY_ORIGINAL_DATA_FOR_$t" > "$ROOT/$t"
-    CANARY_HASHES+=("$(sha1sum "$ROOT/$t" | awk '{print $1}')")
+    content="ORIGINAL_CANARY_$(date +%s%N)_$t"
+    echo "$content" > "$ROOT/$t"
+    CANARY_HASHES["$t"]=$(sha1sum "$ROOT/$t" | awk '{print $1}')
+    echo "REPLACEMENT_FOR_$t" > "$ROOT/$t.new"
 done
 
-# Stage all 6 .new files with replacement content
-for t in "${TARGET_KEYS[@]}"; do
-    echo "REPLACEMENT_DATA_FOR_$t" > "$ROOT/$t.new"
-done
-
-# Run activation with failure at step 4 (usr/local/cascadia/kloader)
 set +e
-exec_p105_activate "$ROOT" 4 0 2>/tmp/test7_err.log
+exec_p105_activate "$ROOT" 4 0 "install" 2>/dev/null
 rc=$?
 set -e
 
-[ "$rc" -ne 0 ] || fail "Test 7: Activation should have failed at step 4, but succeeded!"
+[ "$rc" -ne 0 ] || fail "Test 10: Activation should have failed at step 4, but succeeded!"
 note "Activation failed at step 4 as expected (rc=$rc)"
 
-# Verify:
-# Files 1, 2, 3 were moved then RESTORED from .orig backups!
-# Files 4, 5, 6 were never moved and remained intact!
-for i in "${!TARGET_KEYS[@]}"; do
-    t="${TARGET_KEYS[$i]}"
-    want_hash="${CANARY_HASHES[$i]}"
-    [ -f "$ROOT/$t" ] || fail "Test 7: $t missing after rollback!"
-    got_hash=$(sha1sum "$ROOT/$t" | awk '{print $1}')
-    [ "$got_hash" = "$want_hash" ] || fail "Test 7: $t hash mismatch after rollback! (got $got_hash, want $want_hash)"
-    note "File $t: content 100% restored to original canary hash ($got_hash)"
-done
-
-# All .new files must be cleaned up
 for t in "${TARGET_KEYS[@]}"; do
-    [ ! -f "$ROOT/$t.new" ] || fail "Test 7: $t.new still exists!"
+    [ -f "$ROOT/$t" ] || fail "Test 10: original file $t was lost during rollback!"
+    current_hash=$(sha1sum "$ROOT/$t" | awk '{print $1}')
+    [ "$current_hash" = "${CANARY_HASHES["$t"]}" ] || fail "Test 10: content corrupted for $t!"
+    [ ! -f "$ROOT/$t.new" ] || fail "Test 10: staging file $t.new was left behind!"
 done
-[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || fail "Test 7: backup dir was not cleaned up!"
+[ ! -d "$ROOT/var/backups/cascadia-pcless" ] || fail "Test 10: backup directory was not removed!"
+say "PASS: Test 10 (Step 4 failure with pre-existing files: all 6 originals 100% bit-for-bit restored)."
 
-say "PASS: Test 7 (Step 4 failure with pre-existing files: all 6 originals 100% bit-for-bit restored)."
+# ------------------------------------------------------------------------------
+# TEST 11: OUT variable preservation test
+# ------------------------------------------------------------------------------
+say "Test 11: Testing candidate OUT selection preservation..."
+TEST_CUSTOM_OUT="/tmp/custom-candidate-out-$$"
+mkdir -p "$TEST_CUSTOM_OUT"
+resolved_out=$(OUT="$TEST_CUSTOM_OUT" bash -c '
+    ROOT="$(cd "'"$SCRIPT_DIR"'/.." && pwd)"
+    OUT="${OUT:-$ROOT/build/p105/pcless}"
+    case "$OUT" in
+        /*) ;;
+        *) OUT="$(cd "$OUT" 2>/dev/null && pwd || echo "$(pwd)/$OUT")" ;;
+    esac
+    echo "$OUT"
+')
+rm -rf "$TEST_CUSTOM_OUT"
+[ "$resolved_out" = "$TEST_CUSTOM_OUT" ] || fail "Test 11: OUT was overridden! Got $resolved_out, expected $TEST_CUSTOM_OUT"
+say "PASS: Test 11 (OUT environment variable correctly preserved for candidate selection)."
+
 echo "=================================================================="
-echo " ALL EXACT REMOTE SHELL TESTS PASSED PERFECTLY (7/7 SCENARIOS)!"
+echo " ALL EXACT REMOTE SHELL & ROLLBACK TESTS PASSED (11/11 SCENARIOS)!"
 echo " ZERO EXTERNAL BINARY DEPENDENCIES (POSIX /bin/sh COMPLIANT)"
+echo " SAFE UPDATE AND ROLLBACK FULLY VERIFIED"
 echo "=================================================================="

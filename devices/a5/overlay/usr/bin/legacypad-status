@@ -1,13 +1,142 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
+# Derived from Project Cascadia for LegacyPad-Linux
 # legacypad-status -- Lightweight runtime diagnostic for LegacyPad / Cascadia RAM Linux
-# Reports hardware model, uptime, memory, storage mount, and network interface status.
+# Reports hardware model, uptime, memory, storage mount, network interfaces, and NAND write-lock status.
+
+set -e
+
 echo "=================================================="
 echo " LegacyPad RAM Linux (32 GB iPad mini 1 / P105AP)"
-echo " Host Kernel:  $(uname -srm 2>/dev/null || uname -a)"
+
+# Hardware model
+if [ -r /proc/device-tree/model ]; then
+    model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "iPad mini 1 (iPad2,5)")
+else
+    model="iPad mini 1 (iPad2,5 / P105AP)"
+fi
+echo " Hardware:     $model"
+
+# Kernel
+echo " Kernel:       $(uname -srm 2>/dev/null || uname -a)"
+
+# System time and uptime
 echo " System Time:  $(date -u 2>/dev/null || echo 'Unknown')"
-echo " Memory Free:  $(free -m 2>/dev/null | awk 'NR==2{print $4 " MB free of " $2 " MB total"}')"
-echo " Storage Root: $(awk '$2=="/"{print $1 " on " $2 " (" $3 ")"}' /proc/mounts 2>/dev/null)"
-echo " IP Address:   $(ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' || echo 'N/A')"
-echo " Status:       Immutable RAM root active; NAND write locked"
+if [ -r /proc/uptime ]; then
+    up_secs=$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo "0")
+    up_min=$((up_secs / 60))
+    up_hr=$((up_min / 60))
+    up_rem_min=$((up_min % 60))
+    echo " Uptime:       ${up_hr}h ${up_rem_min}m (${up_secs}s)"
+fi
+
+# Memory
+if [ -r /proc/meminfo ]; then
+    mem_total=$(awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
+    mem_free=$(awk '/MemFree:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "?")
+    mem_avail=$(awk '/MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo "$mem_free")
+    echo " Memory:       ${mem_avail} MB available of ${mem_total} MB total"
+else
+    echo " Memory:       $(free -m 2>/dev/null | awk 'NR==2{print $4 " MB free of " $2 " MB total"}' || echo 'Unknown')"
+fi
+
+# Storage Root
+root_mount=$(awk '$2=="/"{print $1 " (" $3 ", " $4 ")"}' /proc/mounts 2>/dev/null || echo "Unknown")
+echo " Root Mount:   $root_mount"
+
+# Network Interfaces (dynamically detect wlan0, usb0, eth0, or any interface with an IPv4 address)
+net_info=""
+if type ip >/dev/null 2>&1; then
+    net_info=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2 ": " $4}' | paste -sd ", " -)
+fi
+if [ -z "$net_info" ] && type ifconfig >/dev/null 2>&1; then
+    net_info=$(ifconfig 2>/dev/null | awk '
+        /^[a-zA-Z0-9]/ {iface=$1; sub(/:$/, "", iface)}
+        /inet / && iface != "lo" {sub(/addr:/, "", $2); print iface ": " $2}
+    ' | paste -sd ", " -)
+fi
+if [ -z "$net_info" ]; then
+    if [ -d /sys/class/net/wlan0 ]; then
+        net_info="wlan0 (unassociated / no IPv4 lease)"
+    elif [ -d /sys/class/net/usb0 ]; then
+        net_info="usb0 (link down / no IPv4 lease)"
+    else
+        net_info="None detected (no global IPv4 address)"
+    fi
+fi
+echo " Network IP:   $net_info"
+
+# Power & Battery Diagnostics
+bat_path="/sys/class/power_supply/battery"
+pmu_path="/sys/class/power_supply/apple-pmu-usb"
+
+if [ -d "$bat_path" ] || [ -d "$pmu_path" ]; then
+    bat_status=$(cat "$bat_path/status" 2>/dev/null || echo "Unknown")
+    bat_cap=$(cat "$bat_path/capacity" 2>/dev/null || echo "?")
+    raw_cur=$(cat "$bat_path/current_now" 2>/dev/null || echo "0")
+    raw_volt=$(cat "$bat_path/voltage_now" 2>/dev/null || echo "0")
+    raw_temp=$(cat "$bat_path/temp" 2>/dev/null || echo "0")
+
+    bat_cur_ma=$((raw_cur / 1000))
+    volt_mv=$((raw_volt / 1000))
+    volt_int=$((volt_mv / 1000))
+    volt_dec=$(( (volt_mv % 1000) / 10 ))
+    bat_volt_v="${volt_int}.$(printf "%02d" "$volt_dec") V"
+
+    temp_int=$((raw_temp / 10))
+    temp_dec=$((raw_temp % 10))
+    [ "$temp_dec" -lt 0 ] && temp_dec=$((-temp_dec))
+    bat_temp_c="${temp_int}.${temp_dec} °C"
+
+    pmu_online=$(cat "$pmu_path/online" 2>/dev/null || echo "0")
+    raw_lim=$(cat "$pmu_path/input_current_limit" 2>/dev/null || echo "0")
+    pmu_limit_ma=$((raw_lim / 1000))
+
+    if [ "$bat_cur_ma" -gt 0 ]; then
+        cur_fmt="+${bat_cur_ma} mA (Charging)"
+    elif [ "$bat_cur_ma" -lt 0 ]; then
+        cur_fmt="${bat_cur_ma} mA (Discharging)"
+    else
+        cur_fmt="0 mA (Idle)"
+    fi
+
+    echo " Battery:      ${bat_cap}% (${bat_status}) | ${bat_volt_v} | ${bat_temp_c} | ${cur_fmt}"
+
+    if [ "$pmu_online" -eq 1 ]; then
+        echo " USB Input:    CONNECTED (${pmu_limit_ma} mA limit)"
+        if [ "$bat_cur_ma" -lt 0 ]; then
+            echo " [!] CRITICAL: Battery is DISCHARGING (${bat_cur_ma} mA) on cable!"
+            echo "               Input limit is inadequate (e.g. 100 mA sag). Connect 10W+ wall charger!"
+        elif [ "$pmu_limit_ma" -le 100 ]; then
+            echo " [!] WARNING:  PMU input limit clamped to 100 mA (sag backoff active)."
+        fi
+    else
+        echo " USB Input:    DISCONNECTED (Operating on battery)"
+    fi
+fi
+
+# Runtime NAND write-lock & RAM root verification
+cmdline=""
+[ -r /proc/cmdline ] && cmdline=$(cat /proc/cmdline)
+
+has_ram0=0
+case "$root_mount" in
+    *"/dev/ram0"*|*"rootfs"*) has_ram0=1 ;;
+esac
+
+nand_write_flags=0
+case "$cmdline" in
+    *"apple_ppn.allow_write=1"*|*"apple_ftl.enable_write=1"*|*"apple_ftl.write_volume"*) nand_write_flags=1 ;;
+esac
+
+rw_nand_mounts=$(awk '$1 ~ /^\/dev\/(ftl|nand|apple_nand)/ && $4 ~ /(^|,)rw(,|$)/ {print $1}' /proc/mounts 2>/dev/null || true)
+
+if [ "$has_ram0" -eq 1 ] && [ "$nand_write_flags" -eq 0 ] && [ -z "$rw_nand_mounts" ]; then
+    echo " Status:       VERIFIED -- Immutable RAM root active (/dev/ram0); NAND write-lock enforced"
+else
+    echo " Status:       WARNING -- Deviations detected:"
+    [ "$has_ram0" -eq 0 ] && echo "               - Root filesystem is NOT on /dev/ram0!"
+    [ "$nand_write_flags" -eq 1 ] && echo "               - NAND write permissions detected in kernel cmdline!"
+    [ -n "$rw_nand_mounts" ] && echo "               - Writable NAND mounts detected: $rw_nand_mounts"
+fi
 echo "=================================================="
